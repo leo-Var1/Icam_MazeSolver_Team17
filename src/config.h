@@ -27,7 +27,7 @@
 // ⚠️ Ne JAMAIS attacher une interruption sur A0
 
 // ── Adresses I2C ─────────────────────────────────────────────
-#define I2C_MCP23017    0x20  // A0=A1=A2=GND
+#define I2C_MCP23017    0x27  // A0=A1=A2=VCC
 #define I2C_MPU6050     0x68  // AD0=GND
 
 // Adresses VL53L0X assignées dynamiquement via XSHUT au boot
@@ -37,15 +37,16 @@
 #define TOF_ADDR_SIDE_R   0x33  // 45° droite
 
 // ── Pins XSHUT sur MCP23017 (GPA) ────────────────────────────
-#define MCP_XSHUT_FL    0    // GPA0 → Front Left
-#define MCP_XSHUT_FR    1    // GPA1 → Front Right
+// NB : numérotation Adafruit MCP23X17 → GPA0=0 … GPA7=7, GPB0=8 … GPB7=15
+#define MCP_XSHUT_FR    0    // GPA0 → Front Right
+#define MCP_XSHUT_FL    1    // GPA1 → Front Left
 #define MCP_XSHUT_SL    2    // GPA2 → Side Left
 #define MCP_XSHUT_SR    3    // GPA3 → Side Right
 
 // ── LEDs sur MCP23017 (GPB) ───────────────────────────────────
-#define MCP_LED_RED     12   // GPB4 (pin MCP = 8+4 = 12) — erreur
-#define MCP_LED_YELLOW  13   // GPB5 — exploration Run 1
-#define MCP_LED_GREEN   14   // GPB6 — succès / idle
+#define MCP_LED_RED     8    // GPB0 (pin MCP = 8+0 = 8)  — erreur
+#define MCP_LED_YELLOW  9    // GPB1 (pin MCP = 8+1 = 9)  — exploration Run 1
+#define MCP_LED_GREEN   10   // GPB2 (pin MCP = 8+2 = 10) — succès / idle
 
 // ── Moteurs : PWM ─────────────────────────────────────────────
 #define PWM_RUN1        90   // ~35% — vitesse exploration

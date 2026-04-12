@@ -61,8 +61,9 @@ bool sensors_init(Adafruit_MCP23X17& mcp) {
     bool ok = true;
 
     // Étapes 2–5 : active UN capteur à la fois et lui donne son adresse
-    ok &= init_one_tof(mcp, MCP_XSHUT_FL, tof_fl, TOF_ADDR_FRONT_L);
+    // Ordre : GPA0=FR, GPA1=FL, GPA2=SL, GPA3=SR
     ok &= init_one_tof(mcp, MCP_XSHUT_FR, tof_fr, TOF_ADDR_FRONT_R);
+    ok &= init_one_tof(mcp, MCP_XSHUT_FL, tof_fl, TOF_ADDR_FRONT_L);
     ok &= init_one_tof(mcp, MCP_XSHUT_SL, tof_sl, TOF_ADDR_SIDE_L);
     ok &= init_one_tof(mcp, MCP_XSHUT_SR, tof_sr, TOF_ADDR_SIDE_R);
 
