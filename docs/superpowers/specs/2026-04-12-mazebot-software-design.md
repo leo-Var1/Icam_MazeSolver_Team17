@@ -8,10 +8,10 @@ Robot autonome résolvant un labyrinthe 5x5 (cases 20x20 cm) en deux passes :
 - **Run 2 (Resolution)** : algorithme BFS sur carte memorisee, trajectoire en cloche sans arret, vitesse max (~90% PWM)
 
 ### Contraintes
-- **Deadline competition** : ~28 avril 2026
-- **Soutenance** : ~3 mai 2026
+- **Deadline competition** : 29 avril 2026
+- **Soutenance** : 4 mai 2026
 - **MCU** : ESP8266 NodeMCU 1.0 (ESP-12E), ~80KB RAM libre
-- **Framework** : Arduino via PlatformIO, C++17
+- **Framework** : Arduino via PlatformIO, C++
 - **Zero `delay()`** dans la boucle principale, toujours `millis()`
 - **Zero magic number**, tout dans `config.h`
 - **Zero allocation dynamique** dans les boucles
@@ -42,7 +42,7 @@ L'IHM web est montee des la phase 2 pour servir d'outil de calibration en temps 
 
 | Adresse | Composant |
 |---------|-----------|
-| 0x20    | MCP23017 (expandeur GPIO) |
+| 0x27    | MCP23017 (expandeur GPIO) |
 | 0x68    | MPU6050 (gyroscope/accelerometre) |
 | 0x30    | VL53L0X Front Left (assigne au boot) |
 | 0x31    | VL53L0X Front Right (assigne au boot) |
@@ -53,14 +53,14 @@ L'IHM web est montee des la phase 2 pour servir d'outil de calibration en temps 
 
 | Port | Fonction |
 |------|----------|
-| GPA0 | XSHUT VL53L0X Front Left |
-| GPA1 | XSHUT VL53L0X Front Right |
+| GPA1 | XSHUT VL53L0X Front Left |
+| GPA0 | XSHUT VL53L0X Front Right |
 | GPA2 | XSHUT VL53L0X Side Left 45 deg |
 | GPA3 | XSHUT VL53L0X Side Right 45 deg |
 | GPA4 | GT1140 Capteur de ligne (detection case arrivee) |
-| GPB4 | LED Rouge (erreur/urgence) |
-| GPB5 | LED Jaune (Run 1 exploration) |
-| GPB6 | LED Verte (Run 2 / succes / idle) |
+| GPB0 | LED Rouge (erreur/urgence) |
+| GPB1 | LED Jaune (Run 1 exploration) |
+| GPB2 | LED Verte (Run 2 / succes / idle) |
 
 ### Moteurs & Encodeurs
 
@@ -137,7 +137,7 @@ Au premier boot, le robot execute un diagnostic automatique validant chaque comp
 
 ```
 1. Scanner I2C -> lister toutes les adresses trouvees
-   Attendu : 0x20 (MCP23017), 0x68 (MPU6050)
+   Attendu : 0x27 (MCP23017), 0x68 (MPU6050)
 
 2. Test MCP23017 -> allumer chaque LED sequentiellement (R, J, V)
    Validation visuelle
@@ -166,10 +166,10 @@ Au premier boot, le robot execute un diagnostic automatique validant chaque comp
 
 ```
 === DIAGNOSTIC Robot Eq17 ===
-[I2C]  Scan: 0x20 OK | 0x68 OK
+[I2C]  Scan: 0x27 OK | 0x68 OK
 [MCP]  LEDs: R=OK J=OK V=OK
-[TOF]  FL(0x30): 152mm OK
-[TOF]  FR(0x31): 148mm OK
+[TOF]  FR(0x30): 152mm OK
+[TOF]  FL(0x31): 148mm OK
 [TOF]  SL(0x32): 201mm OK
 [TOF]  SR(0x33): 195mm OK
 [IMU]  MPU6050: yaw=0.3 deg/s OK
