@@ -1,4 +1,5 @@
 # MAZEBOT T17 — Robot Labyrinthe 5x5
+> **Status:** 🟠 Phase 1 Implementation | **Hardware:** Ready for testing | **Target:** 5x5 Maze Completion
 
 **Equipe 17 | ICAM Strasbourg Europe | 2026**
 
