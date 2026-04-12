@@ -26,6 +26,12 @@ A partir de la carte memorisee, l'algorithme BFS calcule le chemin optimal. Le r
 | GT1140 | Capteur de ligne (detection case arrivee) |
 | 3x LEDs (R/J/V) | Indication d'etat |
 
+### Schéma Électrique
+![Schéma Électrique](docs/hardware/Schéma%20elec.png)
+
+### Design du PCB
+![Design du PCB](docs/hardware/PCB.png)
+
 ## Architecture logicielle
 
 ```
