@@ -111,4 +111,6 @@ Le document de specification complet est disponible dans [`docs/superpowers/spec
 
 ## Licence
 
-Projet academique ICAM Strasbourg Europe — Equipe 17.
+Ce projet est sous licence **MIT** - voir le fichier [LICENSE](LICENSE) pour plus de détails.
+
+Projet académique ICAM Strasbourg Europe — Équipe 17.
