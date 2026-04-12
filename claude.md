@@ -251,3 +251,16 @@ enum RobotState {
 3. **A0 encodeur** : jamais d'`attachInterrupt` sur A0 — lire uniquement dans l'ISR de D6 (ENC_R_A)
 4. **ESPAsyncWebServer** : les handlers s'exécutent dans un contexte d'interruption — ne pas appeler de fonctions bloquantes dedans, utiliser des flags
 5. **DRV8833** : `nSLP` doit être HIGH pour activer le driver — vérifier la connexion dans le schéma
+6. **I2C Bus Bottleneck (6 devices on 1 bus)**
+   - *Constraint:* The I2C bus is heavily loaded (MCP, MPU, 4x VL53L0X). 
+   - *Rule:* You MUST initialize `Wire.setClock(400000);` (Fast Mode) in `setup()` to avoid PID loop starvation. Ensure no I2C read is blocking the main state machine.
+
+7. **ESP8266 Single-Core vs Real-Time Constraints**
+   - *Constraint:* The ESP8266 has only one core. AsyncWebServer requests from the Web UI will interrupt the PID loop (which needs strict 50Hz execution) and Encoder ISRs.
+   - *Rule:* Web UI polling must be optimized. 
+   - *Rule:* For `STATE_RUN2_BFS` (speed run), you must prioritize CPU for navigation. 
+
+8. **Kalman Filter vs ToF Outliers**
+   - *Constraint:* VL53L0X sensors occasionally return massive out-of-bounds values (e.g., 8190mm or 65535mm) when hitting a corner or the void.
+   - *Rule:* NEVER feed raw outlier values directly into `kalmanUpdate()`. 
+   - *Rule:* You MUST implement an outlier rejection logic (e.g., reject physical impossibilities like a delta > 500mm in 50ms) BEFORE passing the measurement to the Kalman filter.
