@@ -3889,3 +3889,33 @@ git commit -m "docs: update CLAUDE.md with GT1140 pinout and revised phases"
 | Seuils ToF mur | IHM, calibration auto | Via IHM (RAM) |
 | PID Kp/Ki/Kd | IHM, assistant de tuning | Via IHM (RAM) |
 | Kalman Q/R | IHM, observation courbes | Via IHM (RAM) |
+
+
+
+
+
+
+## ⚠️ Final Requirements & System Vigilance
+
+### 1. Critical Vigilance Points (Hardware/Software Edge Cases)
+**IMPORTANT FOR AI AGENT:** Strictly respect these 3 constraints during implementation:
+- **I2C Bus Bottleneck:** Initialize `Wire.setClock(400000);` (Fast Mode) in `setup()`. Ensure I2C reads are non-blocking to prevent PID starvation.
+- **ESP8266 Single-Core:** Requests from the Web UI will interrupt the PID loop. Optimize polling. For `STATE_RUN2_BFS`, prioritize CPU for navigation.
+- **Kalman Filter Outliers:** VL53L0X sensors return 8190mm or 65535mm on errors. You MUST implement outlier rejection logic (reject physical impossibilities) BEFORE passing data to `kalmanUpdate()`.
+
+### 2. 🎯 Dynamic Target Coordinate (Web UI)
+The target cell (endRow, endCol) MUST be dynamic. Do NOT hardcode it only to (4,4).
+- **Web UI Update (Task 9):**
+  - In the "Maze Card", add a row with:
+    - Input `end-row` (number, min:0, max:4, default:4, label: "Target R:")
+    - Input `end-col` (number, min:0, max:4, default:4, label: "Target C:")
+    - Button "Set Target" (triggers a POST `/target` API call).
+  - *Constraint:* Simple numeric inputs only. No canvas-click logic to ensure zero-bug performance.
+- **BFS Integration (Task 13 & 14):**
+  - Ensure `bfsComputePath` uses variables updated by the `/target` endpoint.
+  - Update the visual maze rendering to draw the red "Target Cell" at these coordinates.
+
+### 3. 🛡️ Safety & Reliability Rules
+- **Pin Safety:** Always initialize motor pins as `OUTPUT` and set them to `LOW` (or Brake mode) immediately at boot.
+- **Non-blocking Code:** NO `delay()` allowed outside of `setup()`. Use the `millis()` state machine pattern.
+- **Serial Feedback:** Print a clear "OK" or "FAIL" message after every critical initialization step (ToF, MCP, IMU).
