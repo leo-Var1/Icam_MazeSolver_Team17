@@ -76,3 +76,21 @@
 #define WALL_E  0b0010   // Est
 #define WALL_S  0b0100   // Sud
 #define WALL_W  0b1000   // Ouest
+
+// ── IMU MPU6050 ───────────────────────────────────────────────
+// Sensibilité gyroscope : plage ±250°/s → 131.0 LSB/(°/s)
+#define IMU_GYRO_SENSITIVITY    131.0f
+
+// Nombre d'échantillons pour calibrer le biais gyro au démarrage
+// Robot immobile pendant (IMU_CALIB_SAMPLES × PID_SAMPLE_MS) ms ≈ 1s
+#define IMU_CALIB_SAMPLES       50
+
+// Seuil en dessous duquel le gyro est considéré "à zéro" (anti-drift)
+// En degrés/seconde — en dessous de cette valeur, on n'intègre pas
+#define IMU_DEADBAND_DPS        0.5f
+
+// Tolérance pour déclarer une rotation de 90° terminée (±5°)
+#define IMU_ROTATION_TOLERANCE  5.0f
+
+// Période d'échantillonnage IMU = même que PID (50 Hz)
+#define IMU_SAMPLE_MS           PID_SAMPLE_MS
