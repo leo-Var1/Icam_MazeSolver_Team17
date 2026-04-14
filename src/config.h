@@ -49,7 +49,7 @@
 #define MCP_LED_GREEN   10   // GPB2 (pin MCP = 8+2 = 10) — succès / idle
 
 // ── Moteurs : PWM ─────────────────────────────────────────────
-#define PWM_RUN1        90   // ~35% — vitesse exploration
+#define PWM_RUN1        95   // ~37% — vitesse exploration (+5%)
 #define PWM_RUN2        230  // ~90% — vitesse résolution
 
 // ── Labyrinthe ────────────────────────────────────────────────
@@ -57,7 +57,7 @@
 #define CELL_SIZE_MM    200  // 200 mm par case
 
 // ── PID ───────────────────────────────────────────────────────
-#define PID_KP          1.2f
+#define PID_KP          2.0f
 #define PID_KI          0.05f
 #define PID_KD          0.8f
 #define PID_SAMPLE_MS   20   // 50 Hz
@@ -77,6 +77,64 @@
 #define WALL_S  0b0100   // Sud
 #define WALL_W  0b1000   // Ouest
 
+// ── Encodeurs ────────────────────────────────────────────────
+// Nombre de ticks par tour de roue (à mesurer physiquement)
+// Valeur typique pour encodeur 20 CPR + réducteur : ajuster après calibration
+#define ENC_TICKS_PER_REV   20
+
+// Diamètre de la roue en mm → circonférence = π × D
+#define WHEEL_DIAMETER_MM   65.0f
+
+// Distance entre les deux roues (voie) en mm — entraxe mesuré physiquement
+#define WHEEL_BASE_MM       125.0f
+
+// Ticks calibrés physiquement (2026-04-14) :
+// 308 ticks mesurés → 220mm réels → recalibré à 280 ticks pour 200mm
+// Roue ∅43mm → périmètre 135.1mm → ~210 ticks/tour (ratio réducteur inclus)
+#define TICKS_PER_MM        1.40f   // 280 ticks / 200mm
+#define TICKS_PER_CELL      280     // 200mm = 1 case
+
+// ── Navigation ────────────────────────────────────────────────
+// PWM pour rotations sur place (plus doux que PWM_RUN1 pour éviter le glissement)
+#define PWM_TURN            165
+// PWM lent en fin de rotation (décélération avant l'arrêt — réduit l'inertie résiduelle)
+#define PWM_TURN_SLOW       100
+// PWM faible pour les micro-corrections (auto-alignement, diagnostic)
+#define PWM_DIAG            40
+
+// Ticks pour une rotation de 90° sur place :
+// Chaque roue parcourt un arc = (PI/2) × (WHEEL_BASE_MM/2)
+// WHEEL_BASE = 125mm → arc = 1.5708 × 62.5 ≈ 98.2mm → 98.2 × 1.40 ≈ 137 ticks
+#define TICKS_PER_90DEG     137
+
+// Seuil de décélération pour la rotation (~68% de TICKS_PER_90DEG)
+// 137 × 0.68 ≈ 93 ticks
+#define TICKS_TURN_DECEL    93
+
+// Durée du frein intermédiaire entre phase rapide et phase lente (ms)
+// Le DRV8833 freine activement (IN1=IN2=HIGH) → tue l'inertie en ~50-80ms
+#define TURN_BRAKE_MS       60
+
+// Impulsion inverse après l'arrêt du virage (correction de dépassement résiduel)
+// Le robot recule brièvement dans le sens opposé pour revenir sur 90° pile
+#define TURN_REVERSE_MS     35    // durée de l'impulsion (ms) — augmenter si trop court
+#define TURN_REVERSE_PWM    90    // PWM de l'impulsion inverse
+
+// Délai de stabilisation après freinage avant de démarrer une rotation (ms)
+#define TURN_SETTLE_MS      80
+
+// ── Seuils capteurs ToF ───────────────────────────────────────
+// Mur frontal détecté si distance < 120mm (les deux capteurs FL et FR)
+#define TOF_WALL_FRONT_MM   120
+// Mur latéral détecté si distance < 100mm (capteurs SL et SR à 45°)
+#define TOF_WALL_SIDE_MM    100
+// Arrêt d'urgence si mur < 50mm devant
+#define TOF_STOP_FRONT_MM   50
+// Distance cible pour l'auto-alignement frontal
+#define TOF_ALIGN_TARGET_MM 40
+// Tolérance d'alignement FL vs FR (en mm)
+#define TOF_ALIGN_TOL_MM    2
+
 // ── IMU MPU6050 ───────────────────────────────────────────────
 // Sensibilité gyroscope : plage ±250°/s → 131.0 LSB/(°/s)
 #define IMU_GYRO_SENSITIVITY    131.0f
@@ -89,8 +147,10 @@
 // En degrés/seconde — en dessous de cette valeur, on n'intègre pas
 #define IMU_DEADBAND_DPS        0.5f
 
-// Tolérance pour déclarer une rotation de 90° terminée (±5°)
-#define IMU_ROTATION_TOLERANCE  5.0f
+// Tolérance pour déclarer une rotation de 90° terminée (±2°)
+// Réduit de 5° à 2° : la décélération par encodeurs absorbe l'inertie,
+// donc on peut s'arrêter plus près de la cible.
+#define IMU_ROTATION_TOLERANCE  2.0f
 
 // Période d'échantillonnage IMU = même que PID (50 Hz)
 #define IMU_SAMPLE_MS           PID_SAMPLE_MS
