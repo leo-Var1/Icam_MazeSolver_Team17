@@ -15,7 +15,10 @@
 enum NavAction {
     ACT_NONE,
     ACT_ADVANCE,
-    ACT_TURN,
+    ACT_TURN,            // rotation rapide (PWM_TURN)
+    ACT_TURN_BRAKE,      // frein court entre phase rapide et lente (tue l'inertie)
+    ACT_TURN_SLOW,       // rotation lente (PWM_TURN_SLOW) — phase de précision
+    ACT_TURN_REVERSE,    // impulsion inverse brève pour corriger le dépassement résiduel
     ACT_TURN_SETTLING,   // phase d'attente avant rotation (stabilisation)
     ACT_AUTO_ALIGN
 };
@@ -33,6 +36,10 @@ static uint32_t    s_settle_start   = 0;      // timestamp début stabilisation
 static ToFReadings s_tof            = { 0, 0, 0, 0 };
 static uint32_t    s_last_tof_ms    = 0;
 
+// ── Timer pour l'affichage Serial live ───────────────────────
+// Affiche l'état du mouvement en cours toutes les PID_SAMPLE_MS ms
+static uint32_t    s_last_log_ms    = 0;
+
 // ── nav_init ──────────────────────────────────────────────────
 void nav_init() {
     s_state  = NAV_IDLE;
@@ -47,10 +54,12 @@ void nav_init() {
 void nav_start_advance() {
     encoders_reset();
     pid_init();             // remet l'intégrateur à zéro
+    s_last_log_ms = millis();
     motors_set(PWM_RUN1, PWM_RUN1);
 
     s_action = ACT_ADVANCE;
     s_state  = NAV_BUSY;
+    Serial.println("[ADV] Avance 1 case — démarrage");
 }
 
 // ── Mise à jour de l'avance ───────────────────────────────────
@@ -92,6 +101,17 @@ static NavState update_advance() {
     pid_update(tL, tR, PWM_RUN1, pwm_l, pwm_r);
     motors_set(pwm_l, pwm_r);
 
+    // ── Affichage live @ PID_SAMPLE_MS ────────────────────────
+    if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
+        s_last_log_ms = now;
+        Serial.print("[ADV] t="); Serial.print(now);
+        Serial.print("ms  tL="); Serial.print(tL);
+        Serial.print("  tR=");   Serial.print(tR);
+        Serial.print("  ecart="); Serial.print(tL - tR);
+        Serial.print("  pwm=");  Serial.print(pwm_l);
+        Serial.print("/");       Serial.println(pwm_r);
+    }
+
     return NAV_BUSY;
 }
 
@@ -103,6 +123,7 @@ static NavState update_advance() {
 // =============================================================
 void nav_start_turn(int quarters) {
     motors_stop();              // frein immédiat avant de tourner
+    encoders_reset();           // reset encodeurs — on va s'en servir pour la décélération
     s_turn_quarters = quarters;
     s_settle_start  = millis();
     s_action = ACT_TURN_SETTLING;
@@ -110,36 +131,108 @@ void nav_start_turn(int quarters) {
 }
 
 // ── Mise à jour de la rotation ────────────────────────────────
+// Phases :
+//   SETTLING → robot immobile, on attend TURN_SETTLE_MS avant de démarrer
+//   TURN     → rotation rapide (PWM_TURN) jusqu'à TICKS_PER_90DEG encodeurs
+//   BRAKE    → frein actif TURN_BRAKE_MS pour tuer l'inertie
+//   REVERSE  → impulsion inverse TURN_REVERSE_MS pour corriger le dépassement
 static NavState update_turn() {
-    // Phase 1 : attente de stabilisation après freinage
+    uint32_t now = millis();
+
+    // ── Phase de stabilisation ─────────────────────────────────
     if (s_action == ACT_TURN_SETTLING) {
-        if (millis() - s_settle_start >= TURN_SETTLE_MS) {
-            // Le robot est arrêté → reset IMU et démarrer la rotation
+        if (now - s_settle_start >= TURN_SETTLE_MS) {
+            // Le robot est bien arrêté → reset IMU + redémarrer encodeurs proprement
             imu_reset_heading();
+            encoders_reset();
+            s_last_log_ms = now;
             if (s_turn_quarters > 0) {
                 motors_turn_right(PWM_TURN);
             } else {
                 motors_turn_left(PWM_TURN);
             }
             s_action = ACT_TURN;
+            Serial.println("[TURN] Démarrage rotation rapide");
         }
         return NAV_BUSY;
     }
 
-    // Phase 2 : détection fin de rotation via IMU
-    float target_deg = abs(s_turn_quarters) * 90.0f;
-    if (imu_rotation_complete(target_deg)) {
-        motors_stop();
-        float actual = imu_get_heading();
-        Serial.print("[NAV] Virage terminé — angle mesuré = ");
-        Serial.print(abs(actual), 1);
-        Serial.print("°  (cible = ");
-        Serial.print(target_deg, 0);
-        Serial.println("°)");
+    // ── Lecture commune encodeurs (moyenne des deux roues) ─────
+    // Pour une rotation sur place, une roue avance et l'autre recule.
+    // On prend la valeur absolue de chaque côté puis on moyenne.
+    long tL = encoders_get_left();
+    long tR = encoders_get_right();
+    long avg_ticks = (labs(tL) + labs(tR)) / 2;
 
-        s_state  = NAV_DONE;
-        s_action = ACT_NONE;
-        return NAV_DONE;
+    // Cibles scalées selon le nombre de quarts de tour (90°, 180°…)
+    int nb = abs(s_turn_quarters);
+    long ticks_decel   = (long)nb * TICKS_TURN_DECEL;
+    long ticks_target  = (long)nb * TICKS_PER_90DEG;
+    long ticks_fallback = ticks_target + ticks_target / 10;  // 110%
+    float target_deg   = nb * 90.0f;
+
+    // ── Phase rapide → décélération ────────────────────────────
+    if (s_action == ACT_TURN) {
+        // Correction symétrie : ticks_left + ticks_right doit être ≈ 0
+        // Si > 0 : roue gauche en avance → ralentir gauche / accélérer droite
+        // Kp volontairement faible (0.3) : on veut juste équilibrer, pas osciller
+        if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
+            s_last_log_ms = now;
+            float err = (float)(tL + tR);
+            int corr = (int)(1.3f * err);
+            corr = constrain(corr, -40, 40);
+            if (s_turn_quarters > 0) {
+                // virage droite : gauche avant (+), droite arrière (-)
+                motors_set(PWM_TURN - corr, -(PWM_TURN + corr));
+            } else {
+                // virage gauche : droite avant (+), gauche arrière (-)
+                motors_set(-(PWM_TURN + corr), PWM_TURN - corr);
+            }
+            Serial.print("[TURN] gyro="); Serial.print(fabsf(imu_get_heading()), 1);
+            Serial.print("°  ticks=");   Serial.print(avg_ticks);
+            Serial.print("  sym_err=");  Serial.print(tL + tR);
+            Serial.println("  phase=RAPIDE");
+        }
+
+        if (avg_ticks >= ticks_target) {
+            motors_stop();
+            s_settle_start = now;
+            s_action = ACT_TURN_BRAKE;
+            Serial.println("[TURN] → Frein");
+        }
+        return NAV_BUSY;
+    }
+
+    // ── Frein ─────────────────────────────────────────────────
+    if (s_action == ACT_TURN_BRAKE) {
+        if (now - s_settle_start >= TURN_BRAKE_MS) {
+            float actual = fabsf(imu_get_heading());
+            Serial.print("[TURN] Après frein — gyro="); Serial.print(actual, 1);
+            Serial.print("°  ticks="); Serial.print(avg_ticks);
+            Serial.println(" → impulsion inverse...");
+            if (s_turn_quarters > 0) {
+                motors_turn_left(TURN_REVERSE_PWM);
+            } else {
+                motors_turn_right(TURN_REVERSE_PWM);
+            }
+            s_settle_start = now;
+            s_action = ACT_TURN_REVERSE;
+        }
+        return NAV_BUSY;
+    }
+
+    // ── Impulsion inverse ──────────────────────────────────────
+    if (s_action == ACT_TURN_REVERSE) {
+        if (now - s_settle_start >= TURN_REVERSE_MS) {
+            motors_stop();
+            float actual = fabsf(imu_get_heading());
+            Serial.print("[TURN] TERMINÉ — gyro="); Serial.print(actual, 1);
+            Serial.print("°  cible="); Serial.print(target_deg, 0);
+            Serial.println("°");
+            s_state  = NAV_DONE;
+            s_action = ACT_NONE;
+            return NAV_DONE;
+        }
     }
 
     return NAV_BUSY;
@@ -219,6 +312,8 @@ NavState nav_update() {
             return update_advance();
 
         case ACT_TURN:
+        case ACT_TURN_BRAKE:
+        case ACT_TURN_REVERSE:
         case ACT_TURN_SETTLING:
             return update_turn();
 
