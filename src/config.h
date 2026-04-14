@@ -49,7 +49,7 @@
 #define MCP_LED_GREEN   10   // GPB2 (pin MCP = 8+2 = 10) — succès / idle
 
 // ── Moteurs : PWM ─────────────────────────────────────────────
-#define PWM_RUN1        90   // ~35% — vitesse exploration
+#define PWM_RUN1        95   // ~37% — vitesse exploration (+5%)
 #define PWM_RUN2        230  // ~90% — vitesse résolution
 
 // ── Labyrinthe ────────────────────────────────────────────────
@@ -57,7 +57,7 @@
 #define CELL_SIZE_MM    200  // 200 mm par case
 
 // ── PID ───────────────────────────────────────────────────────
-#define PID_KP          1.2f
+#define PID_KP          2.0f
 #define PID_KI          0.05f
 #define PID_KD          0.8f
 #define PID_SAMPLE_MS   20   // 50 Hz
@@ -76,6 +76,50 @@
 #define WALL_E  0b0010   // Est
 #define WALL_S  0b0100   // Sud
 #define WALL_W  0b1000   // Ouest
+
+// ── Encodeurs ────────────────────────────────────────────────
+// Nombre de ticks par tour de roue (à mesurer physiquement)
+// Valeur typique pour encodeur 20 CPR + réducteur : ajuster après calibration
+#define ENC_TICKS_PER_REV   20
+
+// Diamètre de la roue en mm → circonférence = π × D
+#define WHEEL_DIAMETER_MM   65.0f
+
+// Distance entre les deux roues (voie) en mm
+#define WHEEL_BASE_MM       150.0f
+
+// Ticks calibrés physiquement (2026-04-14) :
+// 308 ticks mesurés → 220mm réels → recalibré à 280 ticks pour 200mm
+// Roue ∅43mm → périmètre 135.1mm → ~210 ticks/tour (ratio réducteur inclus)
+#define TICKS_PER_MM        1.40f   // 280 ticks / 200mm
+#define TICKS_PER_CELL      280     // 200mm = 1 case
+
+// ── Navigation ────────────────────────────────────────────────
+// PWM pour rotations sur place (plus doux que PWM_RUN1 pour éviter le glissement)
+#define PWM_TURN            70
+// PWM faible pour les micro-corrections (auto-alignement, diagnostic)
+#define PWM_DIAG            40
+
+// Ticks pour une rotation de 90° sur place :
+// Chaque roue parcourt un arc = (PI/2) × (WHEEL_BASE_MM/2)
+// puis on convertit en ticks : arc_mm × TICKS_PER_MM
+// WHEEL_BASE = 150mm → arc = 1.5708 × 75 ≈ 117.8mm → 117.8 × 1.40 ≈ 165 ticks
+#define TICKS_PER_90DEG     165
+
+// Délai de stabilisation après freinage avant de démarrer une rotation (ms)
+#define TURN_SETTLE_MS      80
+
+// ── Seuils capteurs ToF ───────────────────────────────────────
+// Mur frontal détecté si distance < 120mm (les deux capteurs FL et FR)
+#define TOF_WALL_FRONT_MM   120
+// Mur latéral détecté si distance < 100mm (capteurs SL et SR à 45°)
+#define TOF_WALL_SIDE_MM    100
+// Arrêt d'urgence si mur < 50mm devant
+#define TOF_STOP_FRONT_MM   50
+// Distance cible pour l'auto-alignement frontal
+#define TOF_ALIGN_TARGET_MM 40
+// Tolérance d'alignement FL vs FR (en mm)
+#define TOF_ALIGN_TOL_MM    2
 
 // ── IMU MPU6050 ───────────────────────────────────────────────
 // Sensibilité gyroscope : plage ±250°/s → 131.0 LSB/(°/s)

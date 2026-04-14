@@ -31,3 +31,45 @@ void maze_clear_wall(uint8_t row, uint8_t col, uint8_t wall_direction);
 
 // Affiche la carte en Serial (debug)
 void maze_print();
+
+// =============================================================
+//  Position et orientation du robot dans le labyrinthe
+//  Directions : 0=Nord, 1=Est, 2=Sud, 3=Ouest
+// =============================================================
+
+// Retourne la position et direction actuelles du robot
+uint8_t maze_get_row();
+uint8_t maze_get_col();
+uint8_t maze_get_dir();
+
+// Modifie la position/direction du robot (sans déplacement physique)
+void maze_set_pos(uint8_t row, uint8_t col, uint8_t dir);
+
+// Avance la position du robot d'une case dans la direction courante
+// (à appeler APRÈS un nav_start_advance() réussi)
+void maze_advance_robot();
+
+// =============================================================
+//  Mise à jour de la carte depuis les capteurs
+// =============================================================
+
+// Met à jour les murs de la case courante selon les lectures ToF.
+// front/left/right : true = mur présent dans cette direction RELATIVE au robot
+// (left/right sont les capteurs latéraux à 45° → mur si distance < TOF_WALL_SIDE_MM)
+void maze_update_walls(bool front, bool left, bool right);
+
+// Retourne les murs d'une case (bitmask WALL_N/E/S/W)
+uint8_t maze_get_walls(uint8_t row, uint8_t col);
+
+// =============================================================
+//  Trémaux — suivi des visites
+// =============================================================
+
+// Incrémente le compteur de visites de la case (max 2)
+void maze_mark_visited(uint8_t row, uint8_t col);
+
+// Retourne le nombre de visites (0, 1, ou 2)
+uint8_t maze_get_visited(uint8_t row, uint8_t col);
+
+// Retourne true si toutes les cases accessibles ont been visited >= 1
+bool maze_is_fully_explored();
