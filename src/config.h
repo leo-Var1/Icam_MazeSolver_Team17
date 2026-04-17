@@ -49,18 +49,26 @@
 #define MCP_LED_GREEN   10   // GPB2 (pin MCP = 8+2 = 10) — succès / idle
 
 // ── Moteurs : PWM ─────────────────────────────────────────────
-#define PWM_RUN1        95   // ~37% — vitesse exploration (+5%)
+#define PWM_RUN1        65   // ~25% — vitesse exploration
 #define PWM_RUN2        230  // ~90% — vitesse résolution
 
 // ── Labyrinthe ────────────────────────────────────────────────
 #define MAZE_SIZE       5    // grille 5×5
-#define CELL_SIZE_MM    200  // 200 mm par case
+#define CELL_SIZE_MM    220  // 200 mm par case (220mm en réel)
 
-// ── PID ───────────────────────────────────────────────────────
+// ── PID encodeurs (correction dérive ticks gauche/droite) ────
 #define PID_KP          2.0f
 #define PID_KI          0.05f
 #define PID_KD          0.8f
 #define PID_SAMPLE_MS   20   // 50 Hz
+
+// ── PID ToF latéraux (centrage dans le couloir) ───────────────
+// Signal d'erreur = side_left_mm - side_right_mm
+// Si > 0 : trop proche du mur gauche → corriger vers droite
+// Les gains sont plus faibles : la mesure en mm est plus bruitée que les ticks
+#define PID_TOF_KP      0.8f
+#define PID_TOF_KI      0.01f
+#define PID_TOF_KD      0.4f
 
 // ── WiFi Access Point ─────────────────────────────────────────
 #define WIFI_SSID       "Robot_Laby_Eq17"
@@ -92,20 +100,20 @@
 // 308 ticks mesurés → 220mm réels → recalibré à 280 ticks pour 200mm
 // Roue ∅43mm → périmètre 135.1mm → ~210 ticks/tour (ratio réducteur inclus)
 #define TICKS_PER_MM        1.40f   // 280 ticks / 200mm
-#define TICKS_PER_CELL      280     // 200mm = 1 case
+#define TICKS_PER_CELL      245     // 200mm = 1 case
 
 // ── Navigation ────────────────────────────────────────────────
-// PWM pour rotations sur place (plus doux que PWM_RUN1 pour éviter le glissement)
-#define PWM_TURN            165
-// PWM lent en fin de rotation (décélération avant l'arrêt — réduit l'inertie résiduelle)
-#define PWM_TURN_SLOW       100
+// PWM pour rotations sur place — lent pour éviter le glissement
+#define PWM_TURN            120  // roue intérieure en sens inverse (frottement statique élevé)
+// (non utilisé pour l'instant — rotation en une seule phase lente)
+#define PWM_TURN_SLOW       50
 // PWM faible pour les micro-corrections (auto-alignement, diagnostic)
 #define PWM_DIAG            40
 
 // Ticks pour une rotation de 90° sur place :
 // Chaque roue parcourt un arc = (PI/2) × (WHEEL_BASE_MM/2)
 // WHEEL_BASE = 125mm → arc = 1.5708 × 62.5 ≈ 98.2mm → 98.2 × 1.40 ≈ 137 ticks
-#define TICKS_PER_90DEG     137
+#define TICKS_PER_90DEG     125
 
 // Seuil de décélération pour la rotation (~68% de TICKS_PER_90DEG)
 // 137 × 0.68 ≈ 93 ticks
@@ -118,22 +126,60 @@
 // Impulsion inverse après l'arrêt du virage (correction de dépassement résiduel)
 // Le robot recule brièvement dans le sens opposé pour revenir sur 90° pile
 #define TURN_REVERSE_MS     35    // durée de l'impulsion (ms) — augmenter si trop court
-#define TURN_REVERSE_PWM    90    // PWM de l'impulsion inverse
+#define TURN_REVERSE_PWM    70    // PWM de l'impulsion inverse
 
 // Délai de stabilisation après freinage avant de démarrer une rotation (ms)
 #define TURN_SETTLE_MS      80
 
+// ── Demi-tour 180° (constantes séparées — à calibrer indépendamment) ──────
+// Le 180° accumule plus d'inertie que le 90° → frein et reverse plus longs.
+// Ticks cible : légèrement sous 2×90° pour compenser l'inertie accumulée
+#define TICKS_PER_180DEG    300   // ≈ 2×130 - marge. Augmenter si trop court.
+// Seuil décélération 180° (~72% de TICKS_PER_180DEG)
+#define TICKS_TURN_DECEL_180  180
+// Frein actif après la rotation 180° (plus long qu'un 90°)
+#define TURN_BRAKE_MS_180   90    // ms — augmenter si le robot continue de glisser
+// Impulsion inverse 180° : plus longue pour corriger le dépassement résiduel
+#define TURN_REVERSE_MS_180 55    // ms — augmenter si encore trop court
+
 // ── Seuils capteurs ToF ───────────────────────────────────────
 // Mur frontal détecté si distance < 120mm (les deux capteurs FL et FR)
 #define TOF_WALL_FRONT_MM   120
-// Mur latéral détecté si distance < 100mm (capteurs SL et SR à 45°)
-#define TOF_WALL_SIDE_MM    100
+// Mur latéral détecté par les capteurs à 45° (SL, SR).
+// Géométrie : mur à 100mm latéral → capteur à 45° lit 100/cos(45°) ≈ 141mm.
+// On prend 160mm comme seuil avec marge de sécurité → à calibrer physiquement.
+#define TOF_WALL_SIDE_MM    160
 // Arrêt d'urgence si mur < 50mm devant
-#define TOF_STOP_FRONT_MM   50
+#define TOF_STOP_FRONT_MM   60
 // Distance cible pour l'auto-alignement frontal
 #define TOF_ALIGN_TARGET_MM 40
 // Tolérance d'alignement FL vs FR (en mm)
 #define TOF_ALIGN_TOL_MM    2
+
+// Marge de rejet géométrique capteurs latéraux à 45°.
+// Un mur frontal à distance d projette sur le capteur 45° à d × √2.
+// Le capteur latéral est déclaré "vrai mur latéral" seulement si sa
+// lecture est inférieure à (d_frontal × 1.414 - TOF_SIDE_GEOM_MARGIN).
+// → Augmenter si faux positifs persistent, diminuer si vrais murs manqués.
+// Limitation connue : un coin (mur frontal + mur latéral équidistants)
+// peut ne pas être détecté → à calibrer physiquement.
+#define TOF_SIDE_GEOM_MARGIN  30
+
+// ── Calibration fonctionnelle (seuils ajustables via IHM/LittleFS) ──
+// Valeurs par défaut si /calib.json n'existe pas.
+// Toutes en mm.
+#define CALIB_TOF_CENTER_MM      80   // distance latérale cible (centré dans couloir)
+#define CALIB_TOF_TURN_MM        60   // distance frontale → arrêt pile au centre de case
+#define CALIB_TOF_OPENING_L_MM   150  // SL > seuil → passage gauche ouvert
+#define CALIB_TOF_OPENING_R_MM   150  // SR > seuil → passage droit ouvert
+
+// Paramètres d'échantillonnage pour capture (appelée en STATE_IDLE)
+#define CALIB_SAMPLES            20
+#define CALIB_SAMPLE_MS          20
+
+// Plage physique de validité d'une lecture latérale (pour outlier rejection PID)
+#define TOF_SIDE_MIN_MM          20
+#define TOF_SIDE_MAX_MM          500
 
 // ── IMU MPU6050 ───────────────────────────────────────────────
 // Sensibilité gyroscope : plage ±250°/s → 131.0 LSB/(°/s)

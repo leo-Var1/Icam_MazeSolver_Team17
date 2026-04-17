@@ -7,14 +7,22 @@
 #include "config.h"
 #include "pid.h"
 
-// ── Variables internes du PID ─────────────────────────────────
-static float s_integral   = 0.0f;  // somme des erreurs (terme I)
-static float s_prev_error = 0.0f;  // erreur à t-1 (terme D)
+// ── Variables internes — PID encodeurs ───────────────────────
+static float s_integral   = 0.0f;
+static float s_prev_error = 0.0f;
+
+// ── Variables internes — PID ToF ─────────────────────────────
+static float s_tof_integral      = 0.0f;
+static float s_tof_prev_error    = 0.0f;
+static int   s_tof_last_correction = 0;  // fallback outlier : dernière correction valide
 
 // ── pid_init ──────────────────────────────────────────────────
 void pid_init() {
-    s_integral   = 0.0f;
-    s_prev_error = 0.0f;
+    s_integral       = 0.0f;
+    s_prev_error     = 0.0f;
+    s_tof_integral       = 0.0f;
+    s_tof_prev_error     = 0.0f;
+    s_tof_last_correction = 0;
 }
 
 // ── pid_update ────────────────────────────────────────────────
@@ -40,6 +48,53 @@ void pid_update(long ticks_left, long ticks_right, int pwm_base,
 
     // Application : on soustrait la correction à gauche, on l'ajoute à droite
     // → si gauche trop rapide (e>0), correction>0 → on freine gauche, on accélère droite
+    pwm_left  = constrain((int)(pwm_base - correction), 0, 255);
+    pwm_right = constrain((int)(pwm_base + correction), 0, 255);
+}
+
+// ── pid_update_tof ────────────────────────────────────────────
+void pid_update_tof(float side_left_mm, float side_right_mm,
+                    int opening_l_mm, int opening_r_mm,
+                    int pwm_base, int& pwm_left, int& pwm_right) {
+
+    // ── Rejet outlier : capteur hors plage physique ───────────
+    // Si une lecture est aberrante (bruit électronique, coin, void),
+    // on réutilise la dernière correction valide pour éviter les secousses.
+    bool sl_ok = (side_left_mm  >= TOF_SIDE_MIN_MM && side_left_mm  <= TOF_SIDE_MAX_MM);
+    bool sr_ok = (side_right_mm >= TOF_SIDE_MIN_MM && side_right_mm <= TOF_SIDE_MAX_MM);
+    if (!sl_ok || !sr_ok) {
+        pwm_left  = constrain(pwm_base - s_tof_last_correction, 0, 255);
+        pwm_right = constrain(pwm_base + s_tof_last_correction, 0, 255);
+        return;
+    }
+
+    // ── Passage unilatéral (ouverture d'un côté) : correction = 0 ──
+    // Quand un côté est ouvert (> seuil), il n'y a plus de référence latérale
+    // fiable → on avance droit et on laisse l'encodeur PID prendre le relais.
+    if (side_left_mm > opening_l_mm || side_right_mm > opening_r_mm) {
+        s_tof_last_correction = 0;
+        pwm_left  = pwm_base;
+        pwm_right = pwm_base;
+        return;
+    }
+
+    // ── PID classique ─────────────────────────────────────────
+    // Erreur = SL - SR : si > 0, trop près du mur gauche → freiner gauche
+    float e = side_left_mm - side_right_mm;
+
+    s_tof_integral += e;
+    s_tof_integral  = constrain(s_tof_integral, -200.0f, 200.0f);
+
+    float derivative = e - s_tof_prev_error;
+    s_tof_prev_error = e;
+
+    float correction = PID_TOF_KP * e
+                     + PID_TOF_KI * s_tof_integral
+                     + PID_TOF_KD * derivative;
+
+    // Sauvegarde pour fallback outlier (prochaine lecture aberrante)
+    s_tof_last_correction = (int)correction;
+
     pwm_left  = constrain((int)(pwm_base - correction), 0, 255);
     pwm_right = constrain((int)(pwm_base + correction), 0, 255);
 }

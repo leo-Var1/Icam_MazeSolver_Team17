@@ -11,6 +11,8 @@
 #include "motors.h"
 #include "pid.h"
 #include "navigation.h"
+#include "web_ui.h"
+#include "calibration.h"
 
 // ── Objet MCP23017 partagé entre les modules ──────────────────
 Adafruit_MCP23X17 mcp;
@@ -29,6 +31,11 @@ static RobotState robot_state = STATE_IDLE;
 // ── Timers pour les lectures périodiques ─────────────────────
 static uint32_t last_sensor_ms = 0;
 static uint32_t last_imu_ms    = 0;
+
+// ── Mode test murs (touche 'w') ───────────────────────────────
+// Quand actif : affiche distances + murs détectés toutes les 200ms
+static bool      s_wall_test_mode = false;
+static uint32_t  s_last_wall_ms   = 0;
 
 // ── Lecture des touches fléchées (séquences ANSI) ─────────────
 // Les touches fléchées envoient 3 octets : ESC (0x1B) + '[' + lettre
@@ -67,6 +74,7 @@ void setup() {
     // 5) VL53L0X
     Serial.println("[TOF] Initialisation des 4 capteurs VL53L0X...");
     sensors_init(mcp);
+    calibration_init();  // charge /calib.json ou applique les défauts
 
     // 6) Moteurs + encodeurs + navigation
     motors_init();
@@ -76,6 +84,10 @@ void setup() {
     // 7) Grille labyrinthe
     maze_init();
     Serial.println("[MAZE] Grille initialisée (5×5)");
+
+    // 8) IHM Web (Access Point + serveur async)
+    //    À faire APRÈS maze_init() car les handlers lisent la grille.
+    web_ui_init();
 
     // Boot OK
     led_set(mcp, MCP_LED_RED,   false);
@@ -92,6 +104,7 @@ void setup() {
     Serial.println("  l  → moteur GAUCHE seul (diagnostic)");
     Serial.println("  R  → moteur DROIT seul (diagnostic)");
     Serial.println("  p  → affiche les numéros de pins moteurs");
+    Serial.println("  w  → toggle mode test ToF (distances + murs toutes les 200ms)");
     Serial.println("  (affichage live automatique pendant les mouvements)");
 }
 
@@ -113,6 +126,85 @@ void loop() {
     if (nav_st == NAV_DONE) {
         led_set(mcp, MCP_LED_YELLOW, false);
         led_set(mcp, MCP_LED_GREEN, true);
+    }
+
+    // ── Consommation des commandes reçues depuis l'IHM Web ────
+    // Les handlers async ne font QUE poser des flags.
+    // Ici (contexte loop), on peut appeler les fonctions nav_* en sécurité.
+    {
+        WebCmd cmd = web_ui_poll_cmd();
+        NavState cur = nav_get_state();
+        bool libre = (cur == NAV_IDLE || cur == NAV_DONE);
+
+        switch (cmd) {
+            case WEB_CMD_STOP:
+                // Priorité absolue : frein immédiat quel que soit l'état
+                nav_abort();
+                robot_state = STATE_EMERGENCY;
+                led_set(mcp, MCP_LED_YELLOW, false);
+                led_set(mcp, MCP_LED_GREEN,  false);
+                led_set(mcp, MCP_LED_RED,    true);
+                Serial.println("[WEB] STOP urgence");
+                break;
+
+            case WEB_CMD_START1:
+                // TODO phase 5 : lancer Trémaux — pour l'instant, juste l'état+LED
+                robot_state = STATE_RUN1_TREMAUX;
+                led_set(mcp, MCP_LED_GREEN,  false);
+                led_set(mcp, MCP_LED_YELLOW, true);
+                Serial.println("[WEB] Run 1 démarré (stub)");
+                break;
+
+            case WEB_CMD_START2:
+                // TODO phase 6 : lancer BFS vers (target_row, target_col)
+                robot_state = STATE_RUN2_BFS;
+                Serial.print("[WEB] Run 2 démarré (stub) — cible (");
+                Serial.print(web_ui_get_target_row()); Serial.print(",");
+                Serial.print(web_ui_get_target_col()); Serial.println(")");
+                break;
+
+            case WEB_CMD_MOVE_UP:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_advance(); }
+                break;
+            case WEB_CMD_MOVE_DOWN:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_turn(2); }
+                break;
+            case WEB_CMD_MOVE_LEFT:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_turn(-1); }
+                break;
+            case WEB_CMD_MOVE_RIGHT:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_turn(1); }
+                break;
+
+            case WEB_CMD_CALIB_CENTER:
+                if (robot_state == STATE_IDLE) { calib_capture_center();    calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_TURN:
+                if (robot_state == STATE_IDLE) { calib_capture_turn();      calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_OPENING_L:
+                if (robot_state == STATE_IDLE) { calib_capture_opening_l(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_OPENING_R:
+                if (robot_state == STATE_IDLE) { calib_capture_opening_r(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_RESET:
+                if (robot_state == STATE_IDLE) calib_reset_defaults();
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_NONE:
+            default:
+                break;
+        }
     }
 
     // ── Lecture touches Serial (touches fléchées ANSI + touches simples) ──
@@ -210,24 +302,75 @@ void loop() {
                 Serial.print("  MOTOR_L_IN2 = pin "); Serial.println(MOTOR_L_IN2);
                 Serial.print("  MOTOR_R_IN1 = pin "); Serial.println(MOTOR_R_IN1);
                 Serial.print("  MOTOR_R_IN2 = pin "); Serial.println(MOTOR_R_IN2);
+
+            } else if (c == 'w') {
+                // Toggle mode test ToF
+                s_wall_test_mode = !s_wall_test_mode;
+                if (s_wall_test_mode) {
+                    Serial.println("[TOF-TEST] Mode murs ACTIF (200ms) — appuie 'w' pour arrêter");
+                    Serial.print("[TOF-TEST] Seuils : FRONT<"); Serial.print(TOF_WALL_FRONT_MM);
+                    Serial.print("mm  SIDE<");                  Serial.print(TOF_WALL_SIDE_MM);
+                    Serial.println("mm");
+                } else {
+                    Serial.println("[TOF-TEST] Mode murs INACTIF");
+                }
             }
         }
     }
 
-    // ── Affichage ToF + cap @ 500ms quand le robot est à l'arrêt ─
-    // On réduit la fréquence pour ne pas noyer l'affichage live de la navigation
-    if (nav_get_state() == NAV_IDLE && now - last_sensor_ms >= 500) {
+    // ── Affichage ToF + cap @ 500ms + push état IHM ──────────
+    // Mise à jour toujours (pas seulement en IDLE) pour que l'IHM reste vivante
+    // pendant les mouvements. À 500ms d'intervalle, la lecture I2C ne perturbe
+    // pas le PID (qui tourne à 50Hz = 20ms).
+    if (now - last_sensor_ms >= 500) {
         last_sensor_ms = now;
 
         ToFReadings tof;
         sensors_read(tof);
         float heading = imu_get_heading();
 
-        Serial.print("[IDLE] FL="); Serial.print(tof.front_left);
+        Serial.print("[SENS] FL="); Serial.print(tof.front_left);
         Serial.print("mm FR=");    Serial.print(tof.front_right);
         Serial.print("mm SL=");    Serial.print(tof.side_left);
         Serial.print("mm SR=");    Serial.print(tof.side_right);
         Serial.print("mm  cap=");  Serial.print(heading, 1);
         Serial.println("°");
+
+        // Push vers l'IHM Web
+        WebState ws;
+        ws.robot_state = (uint8_t)robot_state;
+        ws.heading     = heading;
+        ws.tof_fl      = tof.front_left;
+        ws.tof_fr      = tof.front_right;
+        ws.tof_sl      = tof.side_left;
+        ws.tof_sr      = tof.side_right;
+        web_ui_set_state(ws);
+    }
+
+    // ── Mode test murs @ 200ms ────────────────────────────────
+    // Indépendant du timer 500ms — période plus courte pour voir les
+    // changements en temps réel quand on approche le robot d'un mur.
+    if (s_wall_test_mode && (now - s_last_wall_ms >= 200)) {
+        s_last_wall_ms = now;
+
+        ToFReadings tof;
+        sensors_read(tof);
+        WallDetection walls = sensors_detect_walls(tof);
+
+        // Ligne 1 : distances brutes (pour calibrer les seuils)
+        Serial.print("[TOF] FL="); Serial.print(tof.front_left);
+        Serial.print("  FR=");     Serial.print(tof.front_right);
+        Serial.print("  SL=");     Serial.print(tof.side_left);
+        Serial.print("  SR=");     Serial.println(tof.side_right);
+
+        // Ligne 2 : murs détectés (affichage graphique ASCII)
+        //   [X] = mur présent   [ ] = pas de mur
+        Serial.print("[MUR]       ");
+        Serial.println(walls.front ? "[ DEVANT ]" : "[        ]");
+        Serial.print("[MUR] ");
+        Serial.print(walls.left  ? "[GAUCHE]" : "[      ]");
+        Serial.print("  robot  ");
+        Serial.println(walls.right ? "[DROITE]" : "[      ]");
+        Serial.println("---");
     }
 }

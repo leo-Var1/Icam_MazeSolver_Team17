@@ -10,6 +10,7 @@
 #include "sensors.h"
 #include "imu.h"
 #include "pid.h"
+#include "calibration.h"
 
 // ── Type d'action en cours ───────────────────────────────────
 enum NavAction {
@@ -78,13 +79,39 @@ static NavState update_advance() {
     long tR = encoders_get_right();
 
     // ── Arrêt d'urgence : mur trop proche devant ──────────────
-    if (s_tof.front_left  > 0 && s_tof.front_left  < TOF_STOP_FRONT_MM &&
-        s_tof.front_right > 0 && s_tof.front_right < TOF_STOP_FRONT_MM) {
-        motors_stop();
-        Serial.println("[NAV] ARRET urgence — mur frontal < 50mm");
-        s_state  = NAV_DONE;
-        s_action = ACT_NONE;
-        return NAV_DONE;
+    // UN seul capteur valide suffit pour l'urgence (sécurité maximale)
+    {
+        bool fl_danger = (s_tof.front_left  > 0 && s_tof.front_left  < TOF_STOP_FRONT_MM);
+        bool fr_danger = (s_tof.front_right > 0 && s_tof.front_right < TOF_STOP_FRONT_MM);
+        if (fl_danger || fr_danger) {
+            motors_stop();
+            Serial.println("[NAV] ARRET urgence — mur frontal < 60mm");
+            s_state  = NAV_DONE;
+            s_action = ACT_NONE;
+            return NAV_DONE;
+        }
+    }
+
+    // ── Arrêt calibré : mur devant à distance TURN ───────────
+    // Calcul de la distance frontale à partir de UN ou DEUX capteurs.
+    // Si les deux sont valides → moyenne. Sinon → on prend celui qui est valide.
+    // Un seul capteur peut suffire si l'autre timeout à courte portée.
+    {
+        bool fl_ok = (s_tof.front_left  > 0 && s_tof.front_left  < TOF_MAX_MM);
+        bool fr_ok = (s_tof.front_right > 0 && s_tof.front_right < TOF_MAX_MM);
+        int front_dist = 0;
+        if      (fl_ok && fr_ok) front_dist = ((int)s_tof.front_left + (int)s_tof.front_right) / 2;
+        else if (fl_ok)          front_dist = s_tof.front_left;
+        else if (fr_ok)          front_dist = s_tof.front_right;
+
+        if (front_dist > 0 && front_dist <= calib_get_turn()) {
+            motors_stop();
+            Serial.print("[NAV] STOP calibré TURN — front=");
+            Serial.print(front_dist); Serial.println("mm");
+            s_state  = NAV_DONE;
+            s_action = ACT_NONE;
+            return NAV_DONE;
+        }
     }
 
     // ── Condition d'arrêt : distance atteinte ─────────────────
@@ -96,20 +123,42 @@ static NavState update_advance() {
         return NAV_DONE;
     }
 
-    // ── PID encodeurs : correction dérive gauche/droite ───────
+    // ── PID : ToF latéraux si les deux murs sont visibles, encodeurs sinon ──
+    // Priorité ToF : plus précis pour le centrage dans le couloir.
+    // Fallback encodeurs : couloir ouvert ou capteur invalide.
     int pwm_l, pwm_r;
-    pid_update(tL, tR, PWM_RUN1, pwm_l, pwm_r);
+    bool tof_valid = (s_tof.side_left  > 0 && s_tof.side_left  < TOF_MAX_MM &&
+                      s_tof.side_right > 0 && s_tof.side_right < TOF_MAX_MM);
+
+    if (tof_valid) {
+        pid_update_tof((float)s_tof.side_left, (float)s_tof.side_right,
+                       calib_get_opening_l(), calib_get_opening_r(),
+                       PWM_RUN1, pwm_l, pwm_r);
+    } else {
+        pid_update(tL, tR, PWM_RUN1, pwm_l, pwm_r);
+    }
     motors_set(pwm_l, pwm_r);
 
     // ── Affichage live @ PID_SAMPLE_MS ────────────────────────
     if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
         s_last_log_ms = now;
-        Serial.print("[ADV] t="); Serial.print(now);
-        Serial.print("ms  tL="); Serial.print(tL);
-        Serial.print("  tR=");   Serial.print(tR);
-        Serial.print("  ecart="); Serial.print(tL - tR);
-        Serial.print("  pwm=");  Serial.print(pwm_l);
-        Serial.print("/");       Serial.println(pwm_r);
+        Serial.print("[ADV] tL="); Serial.print(tL);
+        Serial.print("  tR=");    Serial.print(tR);
+        // Log capteurs frontaux (pour diagnostiquer arrêt TURN)
+        Serial.print("  FL="); Serial.print(s_tof.front_left);
+        Serial.print("  FR="); Serial.print(s_tof.front_right);
+        Serial.print("  TURN="); Serial.print(calib_get_turn());
+        if (tof_valid) {
+            Serial.print("  SL="); Serial.print(s_tof.side_left);
+            Serial.print("  SR="); Serial.print(s_tof.side_right);
+            Serial.print("  err="); Serial.print((int)s_tof.side_left - (int)s_tof.side_right);
+            Serial.print("mm  [PID:ToF]");
+        } else {
+            Serial.print("  ecart="); Serial.print(tL - tR);
+            Serial.print("  [PID:ENC]");
+        }
+        Serial.print("  pwm="); Serial.print(pwm_l);
+        Serial.print("/");      Serial.println(pwm_r);
     }
 
     return NAV_BUSY;
@@ -133,16 +182,14 @@ void nav_start_turn(int quarters) {
 // ── Mise à jour de la rotation ────────────────────────────────
 // Phases :
 //   SETTLING → robot immobile, on attend TURN_SETTLE_MS avant de démarrer
-//   TURN     → rotation rapide (PWM_TURN) jusqu'à TICKS_PER_90DEG encodeurs
-//   BRAKE    → frein actif TURN_BRAKE_MS pour tuer l'inertie
-//   REVERSE  → impulsion inverse TURN_REVERSE_MS pour corriger le dépassement
+//   TURN     → rotation lente (PWM_TURN) jusqu'à la cible en ticks → STOP → DONE
+//   Pas de frein ni d'impulsion inverse : vitesse suffisamment basse pour s'arrêter net.
 static NavState update_turn() {
     uint32_t now = millis();
 
     // ── Phase de stabilisation ─────────────────────────────────
     if (s_action == ACT_TURN_SETTLING) {
         if (now - s_settle_start >= TURN_SETTLE_MS) {
-            // Le robot est bien arrêté → reset IMU + redémarrer encodeurs proprement
             imu_reset_heading();
             encoders_reset();
             s_last_log_ms = now;
@@ -152,78 +199,34 @@ static NavState update_turn() {
                 motors_turn_left(PWM_TURN);
             }
             s_action = ACT_TURN;
-            Serial.println("[TURN] Démarrage rotation rapide");
+            Serial.println("[TURN] Démarrage rotation lente");
         }
         return NAV_BUSY;
     }
 
-    // ── Lecture commune encodeurs (moyenne des deux roues) ─────
-    // Pour une rotation sur place, une roue avance et l'autre recule.
-    // On prend la valeur absolue de chaque côté puis on moyenne.
+    // ── Lecture encodeurs ─────────────────────────────────────
     long tL = encoders_get_left();
     long tR = encoders_get_right();
     long avg_ticks = (labs(tL) + labs(tR)) / 2;
 
-    // Cibles scalées selon le nombre de quarts de tour (90°, 180°…)
+    // Cible : 90° ou 180° (constantes dédiées pour le demi-tour)
     int nb = abs(s_turn_quarters);
-    long ticks_decel   = (long)nb * TICKS_TURN_DECEL;
-    long ticks_target  = (long)nb * TICKS_PER_90DEG;
-    long ticks_fallback = ticks_target + ticks_target / 10;  // 110%
-    float target_deg   = nb * 90.0f;
+    bool is_180 = (nb == 2);
+    long ticks_target = is_180 ? TICKS_PER_180DEG : (long)nb * TICKS_PER_90DEG;
+    float target_deg  = nb * 90.0f;
 
-    // ── Phase rapide → décélération ────────────────────────────
+    // ── Phase de rotation ─────────────────────────────────────
     if (s_action == ACT_TURN) {
-        // Correction symétrie : ticks_left + ticks_right doit être ≈ 0
-        // Si > 0 : roue gauche en avance → ralentir gauche / accélérer droite
-        // Kp volontairement faible (0.3) : on veut juste équilibrer, pas osciller
+        // Log périodique
         if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
             s_last_log_ms = now;
-            float err = (float)(tL + tR);
-            int corr = (int)(1.3f * err);
-            corr = constrain(corr, -40, 40);
-            if (s_turn_quarters > 0) {
-                // virage droite : gauche avant (+), droite arrière (-)
-                motors_set(PWM_TURN - corr, -(PWM_TURN + corr));
-            } else {
-                // virage gauche : droite avant (+), gauche arrière (-)
-                motors_set(-(PWM_TURN + corr), PWM_TURN - corr);
-            }
             Serial.print("[TURN] gyro="); Serial.print(fabsf(imu_get_heading()), 1);
             Serial.print("°  ticks=");   Serial.print(avg_ticks);
-            Serial.print("  sym_err=");  Serial.print(tL + tR);
-            Serial.println("  phase=RAPIDE");
+            Serial.print("/");           Serial.println(ticks_target);
         }
 
+        // Cible atteinte → arrêt direct (PWM faible = peu d'inertie)
         if (avg_ticks >= ticks_target) {
-            motors_stop();
-            s_settle_start = now;
-            s_action = ACT_TURN_BRAKE;
-            Serial.println("[TURN] → Frein");
-        }
-        return NAV_BUSY;
-    }
-
-    // ── Frein ─────────────────────────────────────────────────
-    if (s_action == ACT_TURN_BRAKE) {
-        if (now - s_settle_start >= TURN_BRAKE_MS) {
-            float actual = fabsf(imu_get_heading());
-            Serial.print("[TURN] Après frein — gyro="); Serial.print(actual, 1);
-            Serial.print("°  ticks="); Serial.print(avg_ticks);
-            Serial.println(" → impulsion inverse...");
-            if (s_turn_quarters > 0) {
-                motors_turn_left(TURN_REVERSE_PWM);
-            } else {
-                motors_turn_right(TURN_REVERSE_PWM);
-            }
-            s_settle_start = now;
-            s_action = ACT_TURN_REVERSE;
-        }
-        return NAV_BUSY;
-    }
-
-    // ── Impulsion inverse ──────────────────────────────────────
-    if (s_action == ACT_TURN_REVERSE) {
-        if (now - s_settle_start >= TURN_REVERSE_MS) {
             motors_stop();
             float actual = fabsf(imu_get_heading());
             Serial.print("[TURN] TERMINÉ — gyro="); Serial.print(actual, 1);
