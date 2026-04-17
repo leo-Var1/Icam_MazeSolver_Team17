@@ -205,6 +205,29 @@ static void start_pivot() {
     else                      motors_turn_left(PWM_TURN);
 }
 
+// ── Applique les PWM de pivot avec décélération en fin de course ──
+// avg_ticks : ticks déjà parcourus, target : ticks cible du pivot.
+// Sur les derniers (100-TURN_DECEL_PCT)% : rampe linéaire PWM_TURN→DECEL.
+static void apply_pivot_pwm(long avg_ticks, long target) {
+    long decel_start = target * TURN_DECEL_PCT / 100L;
+    int out_pwm, in_pwm;
+    if (avg_ticks >= decel_start && decel_start < target) {
+        // t ∈ [0,1] : 0 = début décél, 1 = fin pivot
+        float t = (float)(avg_ticks - decel_start) / (float)(target - decel_start);
+        t = constrain(t, 0.0f, 1.0f);
+        out_pwm = (int)(PWM_TURN       + t * (PWM_TURN_DECEL_OUTER - PWM_TURN));
+        in_pwm  = (int)(PWM_TURN_INNER + t * (PWM_TURN_DECEL_INNER - PWM_TURN_INNER));
+        // Garantie minimum pour vaincre le frottement
+        out_pwm = max(out_pwm, PWM_TURN_DECEL_OUTER);
+        in_pwm  = max(in_pwm,  PWM_TURN_DECEL_INNER);
+    } else {
+        out_pwm = PWM_TURN;
+        in_pwm  = PWM_TURN_INNER;
+    }
+    if (s_turn_quarters > 0) motors_set(out_pwm, -in_pwm);   // droite
+    else                      motors_set(-in_pwm,  out_pwm);  // gauche
+}
+
 // ── Mise à jour de la rotation ────────────────────────────────
 // Cinématique décomposée (90°) : pivot 45° → avance courte → pivot 45°
 // 180° : pivot continu jusqu'à TICKS_PER_180DEG.
@@ -237,6 +260,9 @@ static NavState update_turn() {
             Serial.print("[TURN1] ticks="); Serial.print(avg_ticks);
             Serial.print("/");             Serial.println(target);
         }
+
+        // Décélération progressive sur les derniers TURN_DECEL_PCT%
+        apply_pivot_pwm(avg_ticks, target);
 
         if (avg_ticks >= target) {
             motors_stop();
@@ -275,11 +301,12 @@ static NavState update_turn() {
         // Poteau détecté côté intérieur du virage :
         //   virage droite (+1) → intérieur = côté gauche → surveiller SL
         //   virage gauche (-1) → intérieur = côté droit  → surveiller SR
+        int post_thresh = calib_get_post_detect();
         bool post = false;
         if (s_turn_quarters > 0)
-            post = (s_tof.side_left  > 0 && s_tof.side_left  < TOF_POST_DETECT_MM);
+            post = (s_tof.side_left  > 0 && s_tof.side_left  < post_thresh);
         else
-            post = (s_tof.side_right > 0 && s_tof.side_right < TOF_POST_DETECT_MM);
+            post = (s_tof.side_right > 0 && s_tof.side_right < post_thresh);
 
         if (avg_ticks >= TURN_CROSS_TICKS || post) {
             motors_stop();
@@ -296,15 +323,20 @@ static NavState update_turn() {
 
     // ── Phase 2 : second 45° ──────────────────────────────────
     if (s_action == ACT_TURN2) {
+        long target2 = (long)TICKS_PER_45DEG;
+
         if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
             s_last_log_ms = now;
             Serial.print("[TURN2] ticks="); Serial.print(avg_ticks);
-            Serial.print("/");             Serial.println((long)TICKS_PER_45DEG);
+            Serial.print("/");             Serial.println(target2);
         }
 
-        if (avg_ticks >= (long)TICKS_PER_45DEG) {
+        // Décélération progressive identique à TURN1
+        apply_pivot_pwm(avg_ticks, target2);
+
+        if (avg_ticks >= target2) {
             motors_stop();
-            Serial.println("[TURN] 90° terminé (45 + cross + 45)");
+            Serial.println("[TURN] 90° termine (45 + cross + 45)");
             s_state  = NAV_DONE;
             s_action = ACT_NONE;
             return NAV_DONE;

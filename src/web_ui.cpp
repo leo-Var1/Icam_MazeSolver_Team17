@@ -110,18 +110,26 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <h1>Robot Labyrinthe — Équipe 17</h1>
 <div class="wrap">
 
-  <!-- Grille SVG -->
+  <!-- Carte labyrinthe + grille interactive -->
   <div class="panel">
+    <h1 style="margin-top:0;">Carte du Labyrinthe</h1>
     <div class="mode-bar">
       <div class="mode-btn active-start" id="btn-mode-start" onclick="setMode('start')">
-        🟦 Poser DÉPART
+        Poser DEPART
       </div>
       <div class="mode-btn" id="btn-mode-target" onclick="setMode('target')">
-        🟨 Poser ARRIVÉE
+        Poser ARRIVEE
       </div>
     </div>
     <svg id="grid" width="340" height="340" viewBox="-2 -2 344 344"></svg>
-    <div class="hint">Clique sur une case pour placer le départ ou l'arrivée selon le mode sélectionné.</div>
+    <div id="maze-legend" style="font-size:11px;color:#888;margin-top:4px;">
+      <span style="color:#1a5c1a;">&#9632;</span> Visitée &nbsp;
+      <span style="color:#e74c3c;">&#9472;</span> Mur &nbsp;
+      <span style="color:#3498db;">&#9650;</span> Robot &nbsp;
+      <span style="color:#f39c12;">&#9632;</span> Arrivée &nbsp;
+      <span style="color:#2980b9;">&#9632;</span> Départ
+    </div>
+    <div class="hint">Clic case = placer départ/arrivée. Carte mise à jour 1s/poll.</div>
   </div>
 
   <!-- Panneau de contrôle -->
@@ -162,17 +170,19 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="info-row"><span class="lbl">TURN    :</span><span id="cal-turn">—</span> mm</div>
     <div class="info-row"><span class="lbl">OPEN L  :</span><span id="cal-ol">—</span> mm</div>
     <div class="info-row"><span class="lbl">OPEN R  :</span><span id="cal-or">—</span> mm</div>
+    <div class="info-row"><span class="lbl">POTEAU  :</span><span id="cal-post">—</span> mm</div>
     <hr>
     <div class="btn-row">
-      <button class="btn" id="btn-cal-c"  onclick="cal('center')">Capturer CENTER</button>
-      <button class="btn" id="btn-cal-t"  onclick="cal('turn')">Capturer TURN</button>
-      <button class="btn" id="btn-cal-ol" onclick="cal('opening_l')">Capturer OPEN L</button>
-      <button class="btn" id="btn-cal-or" onclick="cal('opening_r')">Capturer OPEN R</button>
+      <button class="btn" id="btn-cal-c"   onclick="cal('center')">Capturer CENTER</button>
+      <button class="btn" id="btn-cal-t"   onclick="cal('turn')">Capturer TURN</button>
+      <button class="btn" id="btn-cal-ol"  onclick="cal('opening_l')">Capturer OPEN L</button>
+      <button class="btn" id="btn-cal-or"  onclick="cal('opening_r')">Capturer OPEN R</button>
+      <button class="btn" id="btn-cal-post" onclick="cal('post')">Capturer POTEAU</button>
     </div>
     <div class="btn-row">
       <button class="btn stop" id="btn-cal-rst" onclick="cal('reset')">Reset defauts</button>
     </div>
-    <div class="hint">IDLE uniquement. Placer le robot puis cliquer. ~400ms de mesure.</div>
+    <div class="hint">IDLE uniquement. Placer le robot pres du poteau puis cliquer POTEAU. ~400ms.</div>
   </div>
 
 </div>
@@ -295,7 +305,7 @@ function updateInfo(st){
 
   // Calibration : uniquement en IDLE (state 0)
   const idle = (i===0);
-  ['btn-cal-c','btn-cal-t','btn-cal-ol','btn-cal-or','btn-cal-rst']
+  ['btn-cal-c','btn-cal-t','btn-cal-ol','btn-cal-or','btn-cal-post','btn-cal-rst']
     .forEach(id => document.getElementById(id).disabled = !idle);
 }
 
@@ -309,6 +319,7 @@ async function pollCalib(){
     document.getElementById('cal-turn').textContent=c.turn;
     document.getElementById('cal-ol').textContent=c.opening_l;
     document.getElementById('cal-or').textContent=c.opening_r;
+    document.getElementById('cal-post').textContent=c.post_detect;
   } catch(e){ console.warn('calib poll',e); }
 }
 
@@ -317,22 +328,29 @@ function move(dir){
         body:JSON.stringify({dir})});
 }
 
-async function poll(){
+// State : 500ms — position, capteurs, ToF (change vite)
+async function pollState(){
   try{
-    const [st,mz]=await Promise.all([
-      fetch('/state').then(r=>r.json()),
-      fetch('/maze').then(r=>r.json())
-    ]);
-    stateData=st;
+    stateData=await fetch('/state').then(r=>r.json());
+    updateInfo(stateData);
+    render();  // re-dessine la position robot à chaque poll état
+  } catch(e){ console.warn('state poll',e); }
+}
+
+// Maze : 1000ms — carte des murs (change lentement)
+async function pollMaze(){
+  try{
+    const mz=await fetch('/maze').then(r=>r.json());
     mazeData=mz.cells;
-    updateInfo(st);
     render();
-  } catch(e){ console.warn('poll error',e); }
+  } catch(e){ console.warn('maze poll',e); }
 }
 
 buildGrid();
-poll();
-setInterval(poll,500);
+pollState();
+pollMaze();
+setInterval(pollState,500);
+setInterval(pollMaze,1000);
 pollCalib();
 setInterval(pollCalib,1000);
 </script>
@@ -483,13 +501,14 @@ static void handle_start_pos_body(AsyncWebServerRequest* req, uint8_t* data, siz
 //  Handlers HTTP — Calibration
 // =============================================================
 
-// GET /calib → JSON des 4 seuils courants
+// GET /calib → JSON des 5 seuils courants
 static void handle_calib_get(AsyncWebServerRequest* req) {
-    StaticJsonDocument<128> doc;
-    doc["center"]    = calib_get_center();
-    doc["turn"]      = calib_get_turn();
-    doc["opening_l"] = calib_get_opening_l();
-    doc["opening_r"] = calib_get_opening_r();
+    StaticJsonDocument<160> doc;
+    doc["center"]       = calib_get_center();
+    doc["turn"]         = calib_get_turn();
+    doc["opening_l"]    = calib_get_opening_l();
+    doc["opening_r"]    = calib_get_opening_r();
+    doc["post_detect"]  = calib_get_post_detect();
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -519,6 +538,11 @@ static void handle_calib_reset(AsyncWebServerRequest* req) {
     s_pending_cmd = WEB_CMD_CALIB_RESET;
     req->send(200, "application/json", "{\"ok\":true}");
 }
+// POST /calib/post → capture seuil poteau alu
+static void handle_calib_post(AsyncWebServerRequest* req) {
+    s_pending_cmd = WEB_CMD_CALIB_POST;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
 
 // =============================================================
 //  web_ui_init
@@ -546,6 +570,7 @@ void web_ui_init() {
     s_server.on("/calib/opening_l",  HTTP_POST, handle_calib_opening_l);
     s_server.on("/calib/opening_r",  HTTP_POST, handle_calib_opening_r);
     s_server.on("/calib/reset",      HTTP_POST, handle_calib_reset);
+    s_server.on("/calib/post",       HTTP_POST, handle_calib_post);
 
     // Routes avec body JSON
     s_server.on("/move", HTTP_POST,

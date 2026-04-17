@@ -35,7 +35,8 @@ enum WebCmd {
     WEB_CMD_CALIB_TURN,      // Capture distance frontale d'arrêt
     WEB_CMD_CALIB_OPENING_L, // Capture seuil passage gauche
     WEB_CMD_CALIB_OPENING_R, // Capture seuil passage droit
-    WEB_CMD_CALIB_RESET      // Remet les seuils à leurs valeurs par défaut
+    WEB_CMD_CALIB_RESET,     // Remet les seuils à leurs valeurs par défaut
+    WEB_CMD_CALIB_POST       // Capture seuil détection poteau alu
 };
 
 // ── État global exposé à l'IHM ─────────────────────────────────

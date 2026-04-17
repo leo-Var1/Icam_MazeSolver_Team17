@@ -201,6 +201,11 @@ void loop() {
                 else Serial.println("[CALIB] ignoré: pas en IDLE");
                 break;
 
+            case WEB_CMD_CALIB_POST:
+                if (robot_state == STATE_IDLE) { calib_capture_post_detect(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
             case WEB_CMD_NONE:
             default:
                 break;

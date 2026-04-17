@@ -125,14 +125,20 @@
 //   En pratique les roues glissent → valeur à ajuster sur le robot réel.
 #define TICKS_PER_45DEG     62
 
-// Phase "cross" : avance courte entre les deux demi-pivots.
-//   ~40mm → 40 × 1.40 ≈ 56 ticks.
-//   Stoppée plus tôt si un poteau alu est détecté côté intérieur.
-#define TURN_CROSS_TICKS    56
+// Décélération fin de pivot (anti-dépassement) :
+//   À TURN_DECEL_PCT% des ticks, on réduit progressivement le PWM.
+//   Rampe linéaire : outer PWM_TURN → PWM_TURN_DECEL_OUTER, inner → PWM_TURN_DECEL_INNER
+#define TURN_DECEL_PCT          78   // commence la décel à 78% du pivot
+#define PWM_TURN_DECEL_OUTER    45   // PWM outer en toute fin de pivot
+#define PWM_TURN_DECEL_INNER    85   // PWM inner en toute fin de pivot
+
+// Phase "cross" : avance entre les deux demi-pivots (~70mm).
+//   70mm × 1.40 ≈ 98 ticks. Stoppée plus tôt si poteau détecté.
+#define TURN_CROSS_TICKS    98
 #define TURN_CROSS_PWM      55
 
-// Seuil de détection poteau pendant la phase cross :
-//   Capteur côté intérieur lit < TOF_POST_DETECT_MM → poteau détecté → arrêt.
+// Seuil de détection poteau (valeur par défaut — ajustable via calibration IHM).
+// Remplacé dynamiquement par calib_get_post_detect() pendant la phase cross.
 #define TOF_POST_DETECT_MM  40
 
 // Délai de stabilisation avant chaque pivot (ms)
@@ -176,6 +182,9 @@
 #define CALIB_TOF_TURN_MM        50   // distance frontale → déclenchement virage
 #define CALIB_TOF_OPENING_L_MM   150  // SL > seuil → passage gauche ouvert
 #define CALIB_TOF_OPENING_R_MM   150  // SR > seuil → passage droit ouvert
+#define CALIB_TOF_POST_MM        40   // seuil détection poteau alu (+ marge 10mm incluse)
+// Marge ajoutée automatiquement lors de la capture : median + POST_DETECT_MARGIN_MM
+#define CALIB_POST_DETECT_MARGIN 10
 
 // Paramètres d'échantillonnage pour capture (appelée en STATE_IDLE)
 #define CALIB_SAMPLES            20
