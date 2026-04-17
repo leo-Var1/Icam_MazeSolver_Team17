@@ -16,11 +16,10 @@
 enum NavAction {
     ACT_NONE,
     ACT_ADVANCE,
-    ACT_TURN,            // rotation rapide (PWM_TURN)
-    ACT_TURN_BRAKE,      // frein court entre phase rapide et lente (tue l'inertie)
-    ACT_TURN_SLOW,       // rotation lente (PWM_TURN_SLOW) — phase de précision
-    ACT_TURN_REVERSE,    // impulsion inverse brève pour corriger le dépassement résiduel
-    ACT_TURN_SETTLING,   // phase d'attente avant rotation (stabilisation)
+    ACT_TURN_SETTLING,   // stabilisation avant de commencer un pivot
+    ACT_TURN1,           // premier pivot 45° (ou 180° complet)
+    ACT_TURN_CROSS,      // avance courte entre les deux demi-pivots (recalage poteau)
+    ACT_TURN2,           // second pivot 45°
     ACT_AUTO_ALIGN
 };
 
@@ -198,59 +197,114 @@ void nav_start_turn(int quarters) {
     s_state  = NAV_BUSY;
 }
 
+// ── Aide interne : démarre un pivot dans la bonne direction ──
+static void start_pivot() {
+    imu_reset_heading();
+    encoders_reset();
+    if (s_turn_quarters > 0) motors_turn_right(PWM_TURN);
+    else                      motors_turn_left(PWM_TURN);
+}
+
 // ── Mise à jour de la rotation ────────────────────────────────
-// Phases :
-//   SETTLING → robot immobile, on attend TURN_SETTLE_MS avant de démarrer
-//   TURN     → rotation lente (PWM_TURN) jusqu'à la cible en ticks → STOP → DONE
-//   Pas de frein ni d'impulsion inverse : vitesse suffisamment basse pour s'arrêter net.
+// Cinématique décomposée (90°) : pivot 45° → avance courte → pivot 45°
+// 180° : pivot continu jusqu'à TICKS_PER_180DEG.
+// Détection de poteau pendant la phase cross (côté intérieur du virage).
 static NavState update_turn() {
     uint32_t now = millis();
 
     // ── Phase de stabilisation ─────────────────────────────────
     if (s_action == ACT_TURN_SETTLING) {
         if (now - s_settle_start >= TURN_SETTLE_MS) {
-            imu_reset_heading();
-            encoders_reset();
             s_last_log_ms = now;
-            if (s_turn_quarters > 0) {
-                motors_turn_right(PWM_TURN);
-            } else {
-                motors_turn_left(PWM_TURN);
-            }
-            s_action = ACT_TURN;
-            Serial.println("[TURN] Démarrage rotation lente");
+            start_pivot();
+            s_action = ACT_TURN1;
+            Serial.println("[TURN] Phase 1 — pivot 45°");
         }
         return NAV_BUSY;
     }
 
-    // ── Lecture encodeurs ─────────────────────────────────────
-    long tL = encoders_get_left();
-    long tR = encoders_get_right();
+    long tL       = encoders_get_left();
+    long tR       = encoders_get_right();
     long avg_ticks = (labs(tL) + labs(tR)) / 2;
+    bool is_180   = (abs(s_turn_quarters) == 2);
 
-    // Cible : 90° ou 180° (constantes dédiées pour le demi-tour)
-    int nb = abs(s_turn_quarters);
-    bool is_180 = (nb == 2);
-    long ticks_target = is_180 ? TICKS_PER_180DEG : (long)nb * TICKS_PER_90DEG;
-    float target_deg  = nb * 90.0f;
+    // ── Phase 1 : premier 45° (ou 180° complet) ───────────────
+    if (s_action == ACT_TURN1) {
+        long target = is_180 ? (long)TICKS_PER_180DEG : (long)TICKS_PER_45DEG;
 
-    // ── Phase de rotation ─────────────────────────────────────
-    if (s_action == ACT_TURN) {
-        // Log périodique
         if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
             s_last_log_ms = now;
-            Serial.print("[TURN] gyro="); Serial.print(fabsf(imu_get_heading()), 1);
-            Serial.print("°  ticks=");   Serial.print(avg_ticks);
-            Serial.print("/");           Serial.println(ticks_target);
+            Serial.print("[TURN1] ticks="); Serial.print(avg_ticks);
+            Serial.print("/");             Serial.println(target);
         }
 
-        // Cible atteinte → arrêt direct (PWM faible = peu d'inertie)
-        if (avg_ticks >= ticks_target) {
+        if (avg_ticks >= target) {
             motors_stop();
-            float actual = fabsf(imu_get_heading());
-            Serial.print("[TURN] TERMINÉ — gyro="); Serial.print(actual, 1);
-            Serial.print("°  cible="); Serial.print(target_deg, 0);
-            Serial.println("°");
+            if (is_180) {
+                Serial.println("[TURN] 180° terminé");
+                s_state  = NAV_DONE;
+                s_action = ACT_NONE;
+                return NAV_DONE;
+            }
+            // → avance courte (phase cross)
+            encoders_reset();
+            s_last_tof_ms = 0;
+            motors_set(TURN_CROSS_PWM, TURN_CROSS_PWM);
+            s_action = ACT_TURN_CROSS;
+            s_last_log_ms = now;
+            Serial.println("[TURN] Phase cross — avance courte");
+        }
+        return NAV_BUSY;
+    }
+
+    // ── Phase cross : avance courte + détection poteau ────────
+    if (s_action == ACT_TURN_CROSS) {
+        // Lecture capteurs (non bloquante)
+        if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
+            sensors_read(s_tof);
+            s_last_tof_ms = now;
+        }
+
+        if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
+            s_last_log_ms = now;
+            Serial.print("[CROSS] ticks="); Serial.print(avg_ticks);
+            Serial.print(" SL="); Serial.print(s_tof.side_left);
+            Serial.print(" SR="); Serial.println(s_tof.side_right);
+        }
+
+        // Poteau détecté côté intérieur du virage :
+        //   virage droite (+1) → intérieur = côté gauche → surveiller SL
+        //   virage gauche (-1) → intérieur = côté droit  → surveiller SR
+        bool post = false;
+        if (s_turn_quarters > 0)
+            post = (s_tof.side_left  > 0 && s_tof.side_left  < TOF_POST_DETECT_MM);
+        else
+            post = (s_tof.side_right > 0 && s_tof.side_right < TOF_POST_DETECT_MM);
+
+        if (avg_ticks >= TURN_CROSS_TICKS || post) {
+            motors_stop();
+            if (post) Serial.println("[TURN] Poteau détecté — position recalée");
+            // → second pivot 45°
+            delay(30);  // micro-pause pour absorber l'inertie
+            start_pivot();
+            s_action = ACT_TURN2;
+            s_last_log_ms = now;
+            Serial.println("[TURN] Phase 2 — pivot 45°");
+        }
+        return NAV_BUSY;
+    }
+
+    // ── Phase 2 : second 45° ──────────────────────────────────
+    if (s_action == ACT_TURN2) {
+        if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
+            s_last_log_ms = now;
+            Serial.print("[TURN2] ticks="); Serial.print(avg_ticks);
+            Serial.print("/");             Serial.println((long)TICKS_PER_45DEG);
+        }
+
+        if (avg_ticks >= (long)TICKS_PER_45DEG) {
+            motors_stop();
+            Serial.println("[TURN] 90° terminé (45 + cross + 45)");
             s_state  = NAV_DONE;
             s_action = ACT_NONE;
             return NAV_DONE;
@@ -333,10 +387,10 @@ NavState nav_update() {
         case ACT_ADVANCE:
             return update_advance();
 
-        case ACT_TURN:
-        case ACT_TURN_BRAKE:
-        case ACT_TURN_REVERSE:
         case ACT_TURN_SETTLING:
+        case ACT_TURN1:
+        case ACT_TURN_CROSS:
+        case ACT_TURN2:
             return update_turn();
 
         case ACT_AUTO_ALIGN:

@@ -116,45 +116,35 @@
 // PWM faible pour les micro-corrections (auto-alignement, diagnostic)
 #define PWM_DIAG            40
 
-// Ticks pour une rotation de 90° sur place :
-// Chaque roue parcourt un arc = (PI/2) × (WHEEL_BASE_MM/2)
-// WHEEL_BASE = 125mm → arc = 1.5708 × 62.5 ≈ 98.2mm → 98.2 × 1.40 ≈ 137 ticks
-#define TICKS_PER_90DEG     125
+// ── Rotation — virage décomposé 45° + cross + 45° ────────────
+// Cinématique : pivot 45° → avance courte (recalage sur poteau) → pivot 45°
+// Le 180° reste un pivot continu (pas de décomposition cross).
+//
+// Ticks pour 45° :
+//   arc = (PI/4) × (WHEEL_BASE/2) = 0.7854 × 62.5 ≈ 49mm → 49 × 1.40 ≈ 69
+//   En pratique les roues glissent → valeur à ajuster sur le robot réel.
+#define TICKS_PER_45DEG     62
 
-// Seuil de décélération pour la rotation (~68% de TICKS_PER_90DEG)
-// 137 × 0.68 ≈ 93 ticks
-#define TICKS_TURN_DECEL    93
+// Phase "cross" : avance courte entre les deux demi-pivots.
+//   ~40mm → 40 × 1.40 ≈ 56 ticks.
+//   Stoppée plus tôt si un poteau alu est détecté côté intérieur.
+#define TURN_CROSS_TICKS    56
+#define TURN_CROSS_PWM      55
 
-// Durée du frein intermédiaire entre phase rapide et phase lente (ms)
-// Le DRV8833 freine activement (IN1=IN2=HIGH) → tue l'inertie en ~50-80ms
-#define TURN_BRAKE_MS       60
+// Seuil de détection poteau pendant la phase cross :
+//   Capteur côté intérieur lit < TOF_POST_DETECT_MM → poteau détecté → arrêt.
+#define TOF_POST_DETECT_MM  40
 
-// Impulsion inverse après l'arrêt du virage (correction de dépassement résiduel)
-// Le robot recule brièvement dans le sens opposé pour revenir sur 90° pile
-#define TURN_REVERSE_MS     35    // durée de l'impulsion (ms) — augmenter si trop court
-#define TURN_REVERSE_PWM    70    // PWM de l'impulsion inverse
-
-// Délai de stabilisation après freinage avant de démarrer une rotation (ms)
+// Délai de stabilisation avant chaque pivot (ms)
 #define TURN_SETTLE_MS      80
 
 // ── Snapshot détection murs (capteurs à 45°) ─────────────────
-// Les capteurs latéraux à 45° regardent en diagonale vers l'avant.
-// Si on lit les murs APRÈS l'arrêt (fin de case), ils voient déjà
-// la case suivante. On snapshot au milieu de la case pour lire
-// les murs de la case courante.
 // Valeur en % de TICKS_PER_CELL (40% = milieu de la case).
 #define WALL_SNAP_PCT       40
 
-// ── Demi-tour 180° (constantes séparées — à calibrer indépendamment) ──────
-// Le 180° accumule plus d'inertie que le 90° → frein et reverse plus longs.
-// Ticks cible : légèrement sous 2×90° pour compenser l'inertie accumulée
-#define TICKS_PER_180DEG    300   // ≈ 2×130 - marge. Augmenter si trop court.
-// Seuil décélération 180° (~72% de TICKS_PER_180DEG)
-#define TICKS_TURN_DECEL_180  180
-// Frein actif après la rotation 180° (plus long qu'un 90°)
-#define TURN_BRAKE_MS_180   90    // ms — augmenter si le robot continue de glisser
-// Impulsion inverse 180° : plus longue pour corriger le dépassement résiduel
-#define TURN_REVERSE_MS_180 55    // ms — augmenter si encore trop court
+// ── Demi-tour 180° ────────────────────────────────────────────
+// 180° = pivot continu (pas de décomposition cross).
+#define TICKS_PER_180DEG    300
 
 // ── Seuils capteurs ToF ───────────────────────────────────────
 // Mur frontal détecté si distance < 120mm (les deux capteurs FL et FR)
@@ -183,7 +173,7 @@
 // Valeurs par défaut si /calib.json n'existe pas.
 // Toutes en mm.
 #define CALIB_TOF_CENTER_MM      80   // distance latérale cible (centré dans couloir)
-#define CALIB_TOF_TURN_MM        60   // distance frontale → arrêt pile au centre de case
+#define CALIB_TOF_TURN_MM        50   // distance frontale → déclenchement virage
 #define CALIB_TOF_OPENING_L_MM   150  // SL > seuil → passage gauche ouvert
 #define CALIB_TOF_OPENING_R_MM   150  // SR > seuil → passage droit ouvert
 
