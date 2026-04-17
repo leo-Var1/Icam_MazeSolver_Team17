@@ -23,6 +23,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include "sensors.h"  // pour WallDetection (snapshot murs milieu de case)
 
 // ── État de la navigation ────────────────────────────────────
 enum NavState {
@@ -65,3 +66,10 @@ void nav_abort();
 
 // ── Lecture de l'état ────────────────────────────────────────
 NavState nav_get_state();
+
+// ── Snapshot murs (capteurs 45°) ─────────────────────────────
+// Retourne les murs détectés au milieu de la dernière case parcourue
+// (échantillonnés à WALL_SNAP_PCT% de TICKS_PER_CELL pendant l'avance).
+// Retourne false si aucun avance n'a encore été effectuée.
+// À utiliser dans tremaux pour éviter les faux positifs liés à l'angle des capteurs.
+bool nav_get_wall_snap(WallDetection& out);

@@ -8,6 +8,7 @@
 #include "maze.h"
 #include "sensors.h"
 #include "navigation.h"
+#include <Arduino.h>
 
 // ── État interne ──────────────────────────────────────────────
 static TremauxPhase s_phase     = TREM_SCAN;
@@ -116,14 +117,26 @@ void tremaux_init() {
 bool tremaux_update() {
     switch (s_phase) {
 
-        // ── SCAN : lire les capteurs + mettre à jour la carte ──
+        // ── SCAN : lire les murs + mettre à jour la carte ────────
+        // Priorité au snapshot pris au milieu de la case pendant l'avance.
+        // Les capteurs à 45° voient la case SUIVANTE en fin de case → ne pas
+        // lire les capteurs en direct ici (sauf au tout premier scan, sans avance).
         case TREM_SCAN: {
-            ToFReadings tof;
-            sensors_read(tof);
-
-            bool front = wall_front(tof);
-            bool left  = wall_left(tof);
-            bool right = wall_right(tof);
+            bool front, left, right;
+            WallDetection snap;
+            if (nav_get_wall_snap(snap)) {
+                // Snapshot disponible : murs lus au milieu de la case courante
+                front = snap.front;
+                left  = snap.left;
+                right = snap.right;
+            } else {
+                // Premier scan (départ) : aucune avance précédente → lire en direct
+                ToFReadings tof;
+                sensors_read(tof);
+                front = wall_front(tof);
+                left  = wall_left(tof);
+                right = wall_right(tof);
+            }
 
             // Mettre à jour les murs de la case courante dans la carte
             maze_update_walls(front, left, right);

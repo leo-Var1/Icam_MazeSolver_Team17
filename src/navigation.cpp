@@ -37,6 +37,12 @@ static uint32_t    s_settle_start   = 0;      // timestamp début stabilisation
 static ToFReadings s_tof            = { 0, 0, 0, 0 };
 static uint32_t    s_last_tof_ms    = 0;
 
+// ── Snapshot murs au milieu de la case ───────────────────────
+// Capteurs à 45° : si on lit les murs à la FIN de la case, on voit
+// déjà la case suivante. On snapshote à WALL_SNAP_PCT% de la case.
+static WallDetection s_wall_snap       = { false, false, false };
+static bool          s_wall_snap_valid = false;
+
 // ── Timer pour l'affichage Serial live ───────────────────────
 // Affiche l'état du mouvement en cours toutes les PID_SAMPLE_MS ms
 static uint32_t    s_last_log_ms    = 0;
@@ -55,6 +61,7 @@ void nav_init() {
 void nav_start_advance() {
     encoders_reset();
     pid_init();             // remet l'intégrateur à zéro
+    s_wall_snap_valid = false;  // reset snapshot pour cette nouvelle case
     s_last_log_ms = millis();
     motors_set(PWM_RUN1, PWM_RUN1);
 
@@ -121,6 +128,18 @@ static NavState update_advance() {
         s_state  = NAV_DONE;
         s_action = ACT_NONE;
         return NAV_DONE;
+    }
+
+    // ── Snapshot murs au milieu de la case ───────────────────────
+    // Pris à WALL_SNAP_PCT% des ticks pour avoir les murs de la case courante
+    // (pas ceux de la suivante, que les capteurs à 45° voient en fin de case).
+    if (!s_wall_snap_valid && avg_ticks >= (long)(TICKS_PER_CELL * WALL_SNAP_PCT / 100)) {
+        s_wall_snap = sensors_detect_walls(s_tof);
+        s_wall_snap_valid = true;
+        Serial.print("[NAV] Wall snap @ ticks="); Serial.print(avg_ticks);
+        Serial.print(" F="); Serial.print((int)s_wall_snap.front);
+        Serial.print(" G="); Serial.print((int)s_wall_snap.left);
+        Serial.print(" D="); Serial.println((int)s_wall_snap.right);
     }
 
     // ── PID : ToF latéraux si les deux murs sont visibles, encodeurs sinon ──
@@ -326,6 +345,13 @@ NavState nav_update() {
         default:
             return NAV_IDLE;
     }
+}
+
+// ── nav_get_wall_snap ─────────────────────────────────────────
+bool nav_get_wall_snap(WallDetection& out) {
+    if (!s_wall_snap_valid) return false;
+    out = s_wall_snap;
+    return true;
 }
 
 // ── nav_abort ────────────────────────────────────────────────

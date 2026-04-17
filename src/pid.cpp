@@ -92,6 +92,10 @@ void pid_update_tof(float side_left_mm, float side_right_mm,
                      + PID_TOF_KI * s_tof_integral
                      + PID_TOF_KD * derivative;
 
+    // Cap : empêche un moteur d'accélérer trop au-dessus de la base PWM.
+    // Sans cap, un grand écart ferait monter un moteur bien au-delà de PWM_RUN1.
+    correction = constrain(correction, -(float)PID_TOF_MAX_CORR, (float)PID_TOF_MAX_CORR);
+
     // Sauvegarde pour fallback outlier (prochaine lecture aberrante)
     s_tof_last_correction = (int)correction;
 

@@ -61,16 +61,26 @@ void motors_stop() {
 }
 
 // ── motors_turn_left / motors_turn_right ─────────────────────
-// Rotation sur place : un moteur avant, l'autre arrière.
-// Le sens est déterminé physiquement (câblage moteur gauche inversé pris en compte).
-void motors_turn_left(int pwm) {
-    // Gauche arrière + Droite avant = rotation antihoraire (vue du dessus)
-    motors_set(-pwm, pwm);
+// Rotation sur place asymétrique :
+//   - pwm_outer (paramètre) = roue extérieure (avant)
+//   - PWM_TURN_INNER (config) = roue intérieure (arrière)
+//
+// La roue intérieure va en sens inverse et doit vaincre un frottement
+// statique plus élevé → on lui applique un PWM plus fort (PWM_TURN_INNER).
+// Si PWM_TURN_INNER est trop faible, le moteur stalle et le robot pivote
+// autour de la roue intérieure au lieu de tourner sur place.
+void motors_turn_left(int pwm_outer) {
+    // Rotation antihoraire (vue du dessus) :
+    //   Gauche = intérieure → arrière (fort)
+    //   Droite = extérieure → avant (normal)
+    motors_set(-PWM_TURN_INNER, pwm_outer);
 }
 
-void motors_turn_right(int pwm) {
-    // Gauche avant + Droite arrière = rotation horaire
-    motors_set(pwm, -pwm);
+void motors_turn_right(int pwm_outer) {
+    // Rotation horaire :
+    //   Gauche = extérieure → avant (normal)
+    //   Droite = intérieure → arrière (fort)
+    motors_set(pwm_outer, -PWM_TURN_INNER);
 }
 
 // ── motors_coast ──────────────────────────────────────────────

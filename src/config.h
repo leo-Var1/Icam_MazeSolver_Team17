@@ -65,10 +65,14 @@
 // ── PID ToF latéraux (centrage dans le couloir) ───────────────
 // Signal d'erreur = side_left_mm - side_right_mm
 // Si > 0 : trop proche du mur gauche → corriger vers droite
-// Les gains sont plus faibles : la mesure en mm est plus bruitée que les ticks
-#define PID_TOF_KP      0.8f
-#define PID_TOF_KI      0.01f
-#define PID_TOF_KD      0.4f
+// KP faible : évite les oscillations (mesure en mm bruitée)
+// KD élevé  : amortit les oscillations
+// KI minimal : évite le windup (dérive lente vers un côté)
+#define PID_TOF_KP      0.3f
+#define PID_TOF_KI      0.002f
+#define PID_TOF_KD      0.8f
+// Cap de correction : empêche un moteur d'accélérer trop au-dessus de la base
+#define PID_TOF_MAX_CORR  20
 
 // ── WiFi Access Point ─────────────────────────────────────────
 #define WIFI_SSID       "Robot_Laby_Eq17"
@@ -103,10 +107,12 @@
 #define TICKS_PER_CELL      245     // 200mm = 1 case
 
 // ── Navigation ────────────────────────────────────────────────
-// PWM pour rotations sur place — lent pour éviter le glissement
-#define PWM_TURN            120  // roue intérieure en sens inverse (frottement statique élevé)
-// (non utilisé pour l'instant — rotation en une seule phase lente)
-#define PWM_TURN_SLOW       50
+// Virage : PWM asymétriques pour compenser le frottement statique.
+// La roue intérieure (arrière) a besoin de plus de couple pour vaincre
+// le frottement statique que la roue extérieure (avant).
+#define PWM_TURN            90   // roue extérieure (avant) — valeur nominale
+#define PWM_TURN_INNER      150  // roue intérieure (arrière) — plus fort : vainc le frottement
+#define PWM_TURN_SLOW       50   // non utilisé actuellement
 // PWM faible pour les micro-corrections (auto-alignement, diagnostic)
 #define PWM_DIAG            40
 
@@ -130,6 +136,14 @@
 
 // Délai de stabilisation après freinage avant de démarrer une rotation (ms)
 #define TURN_SETTLE_MS      80
+
+// ── Snapshot détection murs (capteurs à 45°) ─────────────────
+// Les capteurs latéraux à 45° regardent en diagonale vers l'avant.
+// Si on lit les murs APRÈS l'arrêt (fin de case), ils voient déjà
+// la case suivante. On snapshot au milieu de la case pour lire
+// les murs de la case courante.
+// Valeur en % de TICKS_PER_CELL (40% = milieu de la case).
+#define WALL_SNAP_PCT       40
 
 // ── Demi-tour 180° (constantes séparées — à calibrer indépendamment) ──────
 // Le 180° accumule plus d'inertie que le 90° → frein et reverse plus longs.
