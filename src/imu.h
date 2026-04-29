@@ -43,3 +43,9 @@ void imu_reset_heading();
 // Retourne true si |cap| >= target_deg - IMU_ROTATION_TOLERANCE.
 // Exemple : imu_rotation_complete(90.0f) → vrai entre 85° et 95°
 bool imu_rotation_complete(float target_deg);
+
+// ── Recalibration du biais gyro (robot immobile, ~1s) ────────
+// À appeler quand le robot dérive : refait la moyenne IMU_CALIB_SAMPLES
+// lectures du gyro Z, met à jour le biais et reset le cap à 0°.
+// ⚠ Bloque ~1 seconde. À n'appeler que quand le robot est immobile.
+bool imu_recalibrate();

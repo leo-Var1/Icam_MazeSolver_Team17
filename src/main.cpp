@@ -7,12 +7,14 @@
 #include "sensors.h"
 #include "maze.h"
 #include "imu.h"
-
-// ── Helper : scan une adresse I2C et retourne true si présente ──
-static bool i2c_device_present(uint8_t addr) {
-    Wire.beginTransmission(addr);
-    return (Wire.endTransmission() == 0);
-}
+#include "encoders.h"
+#include "motors.h"
+#include "pid.h"
+#include "navigation.h"
+#include "web_ui.h"
+#include "calibration.h"
+#include "tremaux.h"
+#include "wall_follower.h"
 
 // ── Objet MCP23017 partagé entre les modules ──────────────────
 Adafruit_MCP23X17 mcp;
@@ -24,7 +26,8 @@ enum RobotState {
     STATE_MAZE_COMPLETE,  // LED verte + jaune — carte ok
     STATE_RUN2_BFS,       // LED verte clignotante — résolution
     STATE_FINISHED,       // LED verte fixe + 3 bips
-    STATE_EMERGENCY       // LED rouge fixe — STOP
+    STATE_EMERGENCY,      // LED rouge fixe — STOP
+    STATE_RUN_WALL_R      // LED jaune fixe — main droite (fallback)
 };
 static RobotState robot_state = STATE_IDLE;
 
@@ -32,10 +35,22 @@ static RobotState robot_state = STATE_IDLE;
 static uint32_t last_sensor_ms = 0;
 static uint32_t last_imu_ms    = 0;
 
+// ── Mode test murs (touche 'w') ───────────────────────────────
+// Quand actif : affiche distances + murs détectés toutes les 200ms
+static bool      s_wall_test_mode = false;
+static uint32_t  s_last_wall_ms   = 0;
+
+// ── Lecture des touches fléchées (séquences ANSI) ─────────────
+// Les touches fléchées envoient 3 octets : ESC (0x1B) + '[' + lettre
+//   ↑ = ESC[A   ↓ = ESC[B   → = ESC[C   ← = ESC[D
+// On détecte l'ESC puis on lit les 2 octets suivants.
+static bool s_esc_received = false;  // vrai quand on a reçu ESC, on attend '['
+static bool s_bracket_received = false; // vrai quand on a reçu ESC+'[', on attend la lettre
+
 // ─────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
-    delay(200);  // laisse l'UART se stabiliser
+    delay(200);
     Serial.println("\n[BOOT] Robot Labyrinthe — Équipe 17");
 
     // 1) I2C en Fast Mode (400kHz) obligatoire avec 6 devices sur le bus
@@ -43,77 +58,535 @@ void setup() {
     Wire.setClock(400000);
     Serial.println("[I2C] Bus démarré @ 400kHz");
 
-    // 2) MCP23017 — expandeur GPIO (adresse 0x20)
+    // 2) MCP23017
     if (!mcp.begin_I2C(I2C_MCP23017)) {
         Serial.println("[MCP] ERREUR : MCP23017 non trouvé !");
-        // On reste bloqué : sans MCP, pas de XSHUT ni de LEDs
         while (true) { delay(1000); }
     }
     Serial.println("[MCP] MCP23017 OK");
 
-    // 3) LEDs — init et allume rouge le temps du boot
+    // 3) LEDs — rouge pendant le boot
     leds_init(mcp);
     led_set(mcp, MCP_LED_RED, true);
 
-    // 4) MPU6050 — init complète + calibration gyro
-    //    La calibration prend ~1s (robot doit être immobile)
+    // 4) MPU6050 — calibration gyro (~1s, robot immobile)
     if (!imu_init()) {
-        Serial.println("[IMU] AVERTISSEMENT : IMU non disponible — cap désactivé");
-        // Non bloquant : le robot peut fonctionner sans IMU en phase 1
+        Serial.println("[IMU] AVERTISSEMENT : IMU non disponible");
     }
 
-    // 5) VL53L0X — adressage XSHUT (non bloquant : les capteurs non branchés sont ignorés)
+    // 5) VL53L0X
     Serial.println("[TOF] Initialisation des 4 capteurs VL53L0X...");
-    sensors_init(mcp);   // erreurs déjà affichées dans sensors.cpp capteur par capteur
+    sensors_init(mcp);
+    calibration_init();  // charge /calib.json ou applique les défauts
 
-    // 6) Grille labyrinthe
+    // 6) Moteurs + encodeurs + navigation
+    motors_init();
+    encoders_init();
+    nav_init();
+
+    // 7) Grille labyrinthe
     maze_init();
     Serial.println("[MAZE] Grille initialisée (5×5)");
 
-    // Boot réussi : éteint rouge, allume verte
+    // 8) IHM Web (Access Point + serveur async)
+    //    À faire APRÈS maze_init() car les handlers lisent la grille.
+    web_ui_init();
+
+    // Boot OK
     led_set(mcp, MCP_LED_RED,   false);
     led_set(mcp, MCP_LED_GREEN, true);
     robot_state = STATE_IDLE;
     Serial.println("[BOOT] Système prêt — état IDLE");
     Serial.println("────────────────────────────────");
+    Serial.println("[TEST] Commandes Serial disponibles :");
+    Serial.println("  ↑  (flèche haut)   → avance 1 case (~200mm)");
+    Serial.println("  ↓  (flèche bas)    → demi-tour 180°");
+    Serial.println("  →  (flèche droite) → virage DROITE 90°");
+    Serial.println("  ←  (flèche gauche) → virage GAUCHE 90°");
+    Serial.println("  1  → virage PROPRE 45-40-45 GAUCHE");
+    Serial.println("  2  → virage PROPRE 45-40-45 DROITE");
+    Serial.println("  s  → STOP d'urgence");
+    Serial.println("  l  → moteur GAUCHE seul (diagnostic)");
+    Serial.println("  R  → moteur DROIT seul (diagnostic)");
+    Serial.println("  p  → affiche les numéros de pins moteurs");
+    Serial.println("  w  → toggle mode test ToF (distances + murs toutes les 200ms)");
+    Serial.println("  (affichage live automatique pendant les mouvements)");
 }
 
 // ─────────────────────────────────────────────────────────────
 void loop() {
     uint32_t now = millis();
 
-    // ── Phase 2 : mise à jour IMU toutes les IMU_SAMPLE_MS ms (50 Hz) ──
-    // L'intégration du gyro doit être régulière pour être précise.
-    // Plus le dt est irrégulier, plus l'erreur d'intégration est grande.
+    // ── Mise à jour IMU @ 50Hz ────────────────────────────────
+    // Doit être appelée très régulièrement pour que l'intégration gyro soit précise
     if (now - last_imu_ms >= IMU_SAMPLE_MS) {
         last_imu_ms = now;
         imu_update();
     }
 
-    // ── Affichage cap + ToF toutes les 100ms ──────────────────
-    if (now - last_sensor_ms >= 100) {
+    // ── Navigation : mise à jour du mouvement en cours ────────
+    NavState nav_st = nav_update();
+    if (nav_st == NAV_DONE && robot_state == STATE_IDLE) {
+        led_set(mcp, MCP_LED_YELLOW, false);
+        led_set(mcp, MCP_LED_GREEN, true);
+    }
+
+    // ── Run 1 : Trémaux ───────────────────────────────────────
+    // tremaux_update() orchestre scan/decide/turn/advance à chaque appel.
+    // Il appelle nav_start_* quand nécessaire ; nav_update() ci-dessus
+    // fait avancer la machine de mouvement à chaque itération de loop().
+    if (robot_state == STATE_RUN1_TREMAUX) {
+        bool exploration_done = tremaux_update();
+        if (exploration_done) {
+            robot_state = STATE_MAZE_COMPLETE;
+            led_set(mcp, MCP_LED_YELLOW, false);
+            led_set(mcp, MCP_LED_GREEN,  true);
+            Serial.println("[TREM] Exploration terminee — Run 2 disponible");
+            maze_print();
+        }
+    }
+
+    // ── Run Main Droite (fallback) ────────────────────────────
+    if (robot_state == STATE_RUN_WALL_R) {
+        bool reached = wall_follower_update();
+        if (reached) {
+            robot_state = STATE_FINISHED;
+            led_set(mcp, MCP_LED_YELLOW, false);
+            led_set(mcp, MCP_LED_GREEN,  true);
+            Serial.println("[WF] Cible atteinte — STATE_FINISHED");
+            maze_print();
+        }
+    }
+
+    // ── Consommation des commandes reçues depuis l'IHM Web ────
+    // Les handlers async ne font QUE poser des flags.
+    // Ici (contexte loop), on peut appeler les fonctions nav_* en sécurité.
+    {
+        WebCmd cmd = web_ui_poll_cmd();
+        NavState cur = nav_get_state();
+        bool libre = (cur == NAV_IDLE || cur == NAV_DONE);
+
+        switch (cmd) {
+            case WEB_CMD_STOP:
+                nav_abort();
+                robot_state = STATE_EMERGENCY;
+                led_set(mcp, MCP_LED_YELLOW, false);
+                led_set(mcp, MCP_LED_GREEN,  false);
+                led_set(mcp, MCP_LED_RED,    true);
+                Serial.println("[WEB] STOP urgence");
+                break;
+
+            case WEB_CMD_RESET_IDLE:
+                nav_abort();
+                maze_init();
+                robot_state = STATE_IDLE;
+                led_set(mcp, MCP_LED_RED,    false);
+                led_set(mcp, MCP_LED_YELLOW, false);
+                led_set(mcp, MCP_LED_GREEN,  true);
+                Serial.println("[WEB] Reset -> IDLE (carte effacée)");
+                break;
+
+            case WEB_CMD_START1:
+                maze_init();  // reset carte des murs + visites
+                nav_abort();  // stoppe tout mouvement résiduel
+                tremaux_init(web_ui_get_start_row(), web_ui_get_start_col(), web_ui_get_start_dir());
+                robot_state = STATE_RUN1_TREMAUX;
+                led_set(mcp, MCP_LED_RED,    false);
+                led_set(mcp, MCP_LED_GREEN,  false);
+                led_set(mcp, MCP_LED_YELLOW, true);
+                Serial.println("[WEB] Run 1 Tremaux DEMARRE");
+                break;
+
+            case WEB_CMD_START2:
+                // TODO phase 6 : lancer BFS vers (target_row, target_col)
+                robot_state = STATE_RUN2_BFS;
+                Serial.print("[WEB] Run 2 démarré (stub) — cible (");
+                Serial.print(web_ui_get_target_row()); Serial.print(",");
+                Serial.print(web_ui_get_target_col()); Serial.println(")");
+                break;
+
+            case WEB_CMD_START_WALL_R:
+                maze_init();
+                nav_abort();
+                wall_follower_init(web_ui_get_start_row(), web_ui_get_start_col(), web_ui_get_start_dir());
+                robot_state = STATE_RUN_WALL_R;
+                led_set(mcp, MCP_LED_RED,    false);
+                led_set(mcp, MCP_LED_GREEN,  false);
+                led_set(mcp, MCP_LED_YELLOW, true);
+                Serial.println("[WEB] Main Droite DEMARRE");
+                break;
+
+            case WEB_CMD_MOVE_UP:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_advance(); }
+                break;
+            case WEB_CMD_MOVE_DOWN:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_turn(2); }
+                break;
+            case WEB_CMD_MOVE_LEFT:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_turn(-1); }
+                break;
+            case WEB_CMD_MOVE_RIGHT:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_turn(1); }
+                break;
+
+            case WEB_CMD_SMOOTH_L:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_smooth_turn(-1); }
+                break;
+            case WEB_CMD_SMOOTH_R:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_smooth_turn(1); }
+                break;
+
+            case WEB_CMD_CALIB_CENTER:
+                if (robot_state == STATE_IDLE) { calib_capture_center();    calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_TURN:
+                if (robot_state == STATE_IDLE) { calib_capture_turn();      calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_OPENING_L:
+                if (robot_state == STATE_IDLE) { calib_capture_opening_l(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_OPENING_R:
+                if (robot_state == STATE_IDLE) { calib_capture_opening_r(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_RESET:
+                if (robot_state == STATE_IDLE) calib_reset_defaults();
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_POST:
+                if (robot_state == STATE_IDLE) { calib_capture_post_detect(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_WALL_L:
+                if (robot_state == STATE_IDLE) { calib_capture_wall_l(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_WALL_R:
+                if (robot_state == STATE_IDLE) { calib_capture_wall_r(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PIVOT_90:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_pivot_90_ticks(web_ui_last_value());
+                    Serial.print("[CALIB] pivot_90_ticks <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_CELL:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_cell_ticks(web_ui_last_value());
+                    Serial.print("[CALIB] cell_ticks <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PIV45_R:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_pivot_45_r(web_ui_last_value());
+                    Serial.print("[CALIB] pivot_45_r <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PIV45_L:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_pivot_45_l(web_ui_last_value());
+                    Serial.print("[CALIB] pivot_45_l <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_SMOOTH_MOVE:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_smooth_move(web_ui_last_value());
+                    Serial.print("[CALIB] smooth_move <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_SMOOTH_CENTER:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_smooth_center(web_ui_last_value());
+                    Serial.print("[CALIB] smooth_center <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PID_KP:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_kp(val);
+                    Serial.print("[PID] Kp <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_KI:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_ki(val);
+                    Serial.print("[PID] Ki <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_KD:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_kd(val);
+                    Serial.print("[PID] Kd <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_KP:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_tof_kp(val);
+                    Serial.print("[PID-TOF] Kp <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_KI:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_tof_ki(val);
+                    Serial.print("[PID-TOF] Ki <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_KD:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_tof_kd(val);
+                    Serial.print("[PID-TOF] Kd <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_MAX_CORR:
+                calib_set_pid_tof_max_corr(web_ui_last_value());
+                Serial.print("[PID-TOF] MaxCorr <- "); Serial.println(web_ui_last_value());
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_KP:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_piv_kp(val);
+                    Serial.print("[PID-PIV] Kp <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_KI:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_piv_ki(val);
+                    Serial.print("[PID-PIV] Ki <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_KD:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_piv_kd(val);
+                    Serial.print("[PID-PIV] Kd <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_MAX_CORR:
+                calib_set_pid_piv_max_corr(web_ui_last_value());
+                Serial.print("[PID-PIV] MaxCorr <- "); Serial.println(web_ui_last_value());
+                break;
+
+            case WEB_CMD_NONE:
+            default:
+                break;
+        }
+    }
+
+    // ── Lecture touches Serial (touches fléchées ANSI + touches simples) ──
+    // Les touches fléchées génèrent 3 octets : ESC (0x1B), '[', puis A/B/C/D.
+    // On lit octet par octet avec un mini automate d'état (s_esc_received,
+    // s_bracket_received) pour ne pas bloquer la boucle.
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+
+        if (s_bracket_received) {
+            // 3ème octet de la séquence fléchée → action
+            s_esc_received     = false;
+            s_bracket_received = false;
+
+            // On n'accepte les commandes de mouvement que si le robot est libre
+            NavState cur = nav_get_state();
+            bool libre = (cur == NAV_IDLE || cur == NAV_DONE);
+
+            if (c == 'A') {
+                // ↑ — avance 1 case
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_advance();
+                } else {
+                    Serial.println("[TEST] Mouvement en cours, ignoré");
+                }
+            } else if (c == 'B') {
+                // ↓ — demi-tour 180°
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_turn(2);
+                } else {
+                    Serial.println("[TEST] Mouvement en cours, ignoré");
+                }
+            } else if (c == 'C') {
+                // → — virage droite 90°
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_turn(1);
+                } else {
+                    Serial.println("[TEST] Mouvement en cours, ignoré");
+                }
+            } else if (c == 'D') {
+                // ← — virage gauche 90°
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_turn(-1);
+                } else {
+                    Serial.println("[TEST] Mouvement en cours, ignoré");
+                }
+            }
+
+        } else if (s_esc_received) {
+            // 2ème octet : doit être '[' pour continuer la séquence fléchée
+            if (c == '[') {
+                s_bracket_received = true;
+            } else {
+                s_esc_received = false;  // séquence invalide → on ignore
+            }
+
+        } else if (c == 0x1B) {
+            // 1er octet ESC → début possible d'une séquence fléchée
+            s_esc_received = true;
+
+        } else {
+            // ── Touches simples (non-fléchées) ────────────────
+            NavState cur = nav_get_state();
+            bool libre = (cur == NAV_IDLE || cur == NAV_DONE);
+
+            if (c == '1') {
+                // Virage smooth gauche
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_smooth_turn(-1);
+                }
+            } else if (c == '2') {
+                // Virage smooth droite
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_smooth_turn(1);
+                }
+            } else if (c == 's') {
+                // Arrêt d'urgence
+                nav_abort();
+                led_set(mcp, MCP_LED_YELLOW, false);
+                led_set(mcp, MCP_LED_RED,    true);
+                delay(200);
+                led_set(mcp, MCP_LED_RED,    false);
+                led_set(mcp, MCP_LED_GREEN,  true);
+                Serial.println("[TEST] STOP");
+
+            } else if (c == 'l') {
+                // Moteur GAUCHE seul (diagnostic câblage)
+                nav_abort();
+                Serial.println("[DIAG] Moteur GAUCHE seul");
+                analogWrite(MOTOR_L_IN1, 120);
+                digitalWrite(MOTOR_L_IN2, LOW);
+
+            } else if (c == 'R') {
+                // Moteur DROIT seul (diagnostic câblage)
+                nav_abort();
+                Serial.println("[DIAG] Moteur DROIT seul");
+                analogWrite(MOTOR_R_IN1, 120);
+                digitalWrite(MOTOR_R_IN2, LOW);
+
+            } else if (c == 'p') {
+                // Affiche les pins pour vérifier le câblage
+                Serial.println("[DIAG] Pins moteurs :");
+                Serial.print("  MOTOR_L_IN1 = pin "); Serial.println(MOTOR_L_IN1);
+                Serial.print("  MOTOR_L_IN2 = pin "); Serial.println(MOTOR_L_IN2);
+                Serial.print("  MOTOR_R_IN1 = pin "); Serial.println(MOTOR_R_IN1);
+                Serial.print("  MOTOR_R_IN2 = pin "); Serial.println(MOTOR_R_IN2);
+
+            } else if (c == 'w') {
+                // Toggle mode test ToF
+                s_wall_test_mode = !s_wall_test_mode;
+                if (s_wall_test_mode) {
+                    Serial.println("[TOF-TEST] Mode murs ACTIF (200ms) — appuie 'w' pour arrêter");
+                    Serial.print("[TOF-TEST] Seuils : FRONT<"); Serial.print(TOF_WALL_FRONT_MM);
+                    Serial.print("mm  SIDE<");                  Serial.print(TOF_WALL_SIDE_MM);
+                    Serial.println("mm");
+                } else {
+                    Serial.println("[TOF-TEST] Mode murs INACTIF");
+                }
+            } else if (c == 'p') {
+                // Toggle PID latéral pour A/B test
+                bool now_on = !pid_tof_is_enabled();
+                pid_tof_set_enabled(now_on);
+                Serial.print("[PID-TOF] ");
+                Serial.println(now_on ? "ACTIVE" : "DESACTIVE (encodeurs seuls)");
+            }
+        }
+    }
+
+    // ── Affichage ToF + cap @ 500ms + push état IHM ──────────
+    // Mise à jour toujours (pas seulement en IDLE) pour que l'IHM reste vivante
+    // pendant les mouvements. À 500ms d'intervalle, la lecture I2C ne perturbe
+    // pas le PID (qui tourne à 50Hz = 20ms).
+    if (now - last_sensor_ms >= 500) {
         last_sensor_ms = now;
 
-        // Lecture des 4 ToF
         ToFReadings tof;
         sensors_read(tof);
-
-        // Lecture du cap gyro intégré
         float heading = imu_get_heading();
 
-        // Affichage combiné pour valider les deux phases
-        Serial.print("[ToF] FL=");
-        Serial.print(tof.front_left);
-        Serial.print("mm  FR=");
-        Serial.print(tof.front_right);
-        Serial.print("mm  SL=");
-        Serial.print(tof.side_left);
-        Serial.print("mm  SR=");
-        Serial.print(tof.side_right);
-        Serial.print("mm");
-
-        Serial.print("  [IMU] cap=");
-        Serial.print(heading, 1);   // 1 décimale
+        Serial.print("[SENS] FL="); Serial.print(tof.front_left);
+        Serial.print("mm FR=");    Serial.print(tof.front_right);
+        Serial.print("mm SL=");    Serial.print(tof.side_left);
+        Serial.print("mm SR=");    Serial.print(tof.side_right);
+        Serial.print("mm  cap=");  Serial.print(heading, 1);
         Serial.println("°");
+
+        // Push vers l'IHM Web
+        WebState ws;
+        ws.robot_state = (uint8_t)robot_state;
+        ws.heading     = heading;
+        ws.tof_fl      = tof.front_left;
+        ws.tof_fr      = tof.front_right;
+        ws.tof_sl      = tof.side_left;
+        ws.tof_sr      = tof.side_right;
+        web_ui_set_state(ws);
+    }
+
+    // ── Mode test murs @ 200ms ────────────────────────────────
+    // Indépendant du timer 500ms — période plus courte pour voir les
+    // changements en temps réel quand on approche le robot d'un mur.
+    if (s_wall_test_mode && (now - s_last_wall_ms >= 200)) {
+        s_last_wall_ms = now;
+
+        ToFReadings tof;
+        sensors_read(tof);
+        WallDetection walls = sensors_detect_walls(tof);
+
+        // Ligne 1 : distances brutes (pour calibrer les seuils)
+        Serial.print("[TOF] FL="); Serial.print(tof.front_left);
+        Serial.print("  FR=");     Serial.print(tof.front_right);
+        Serial.print("  SL=");     Serial.print(tof.side_left);
+        Serial.print("  SR=");     Serial.println(tof.side_right);
+
+        // Ligne 2 : murs détectés (affichage graphique ASCII)
+        //   [X] = mur présent   [ ] = pas de mur
+        Serial.print("[MUR]       ");
+        Serial.println(walls.front ? "[ DEVANT ]" : "[        ]");
+        Serial.print("[MUR] ");
+        Serial.print(walls.left  ? "[GAUCHE]" : "[      ]");
+        Serial.print("  robot  ");
+        Serial.println(walls.right ? "[DROITE]" : "[      ]");
+        Serial.println("---");
     }
 }
