@@ -30,6 +30,12 @@ Le robot explore le labyrinthe case par case à vitesse réduite (~35% PWM). À 
 
 ---
 
+### Schéma Électrique
+![Schéma Électrique](docs/hardware/Schéma%20elec.png)
+
+### Design du PCB
+![Design du PCB](docs/hardware/PCB.png)
+
 ## Architecture logicielle
 
 ```
