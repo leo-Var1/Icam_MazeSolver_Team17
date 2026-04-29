@@ -1,92 +1,102 @@
-# MAZEBOT T17 — Robot Labyrinthe 5x5
+# MAZEBOT T17 — Robot Labyrinthe 5×5
 
-**Equipe 17 | ICAM Strasbourg Europe | 2026**
+**Équipe 17 | ICAM Strasbourg Europe | 2026**
 
-Robot autonome capable de resoudre un labyrinthe 5x5 (cases 20x20 cm) en deux passes, pilote par une interface web embarquee.
+Robot autonome résolvant un labyrinthe **5×5** (cases 20×20 cm) en deux passes, piloté par une interface web embarquée via WiFi.
+
+---
 
 ## Fonctionnement
 
-### Run 1 — Exploration (Tremaux)
-Le robot explore le labyrinthe case par case a vitesse reduite. A chaque case, il scanne les murs avec 4 capteurs ToF VL53L0X, met a jour sa carte interne et choisit la direction suivante selon l'algorithme de Tremaux. L'exploration se termine quand le capteur de ligne GT1140 detecte la case d'arrivee (sol noir).
+### Run 1 — Exploration (Trémaux)
+Le robot explore le labyrinthe case par case à vitesse réduite (~35% PWM). À chaque case, il scanne les murs avec 4 capteurs ToF VL53L0X, met à jour sa carte interne et choisit la direction suivante selon l'algorithme de Trémaux.
 
-### Run 2 — Resolution (BFS + trajectoire cloche)
-A partir de la carte memorisee, l'algorithme BFS calcule le chemin optimal. Le robot execute ce chemin a vitesse maximale avec des virages en trajectoire continue (profil en cloche, sans arret).
+### Run 2 — Résolution (BFS)
+À partir de la carte mémorisée, l'algorithme BFS calcule le chemin optimal. Le robot exécute ce chemin à vitesse maximale (~90% PWM).
+
+---
 
 ## Architecture hardware
 
-| Composant | Role |
+| Composant | Rôle |
 |-----------|------|
-| ESP8266 NodeMCU 1.0 | Microcontroleur principal |
+| ESP8266 NodeMCU 1.0 | Microcontrôleur principal |
 | DRV8833 | Driver moteurs DC |
-| 2x Moteurs DC + encodeurs 420 ticks/tour | Propulsion + odometrie |
-| 4x VL53L0X (ToF) | Detection murs (2 frontaux, 2 lateraux a 45 deg) |
-| MPU6050 | Gyroscope (verification rotation) |
-| MCP23017 | Expandeur GPIO (XSHUT, LEDs, GT1140) |
-| GT1140 | Capteur de ligne (detection case arrivee) |
-| 3x LEDs (R/J/V) | Indication d'etat |
+| 2× Moteurs DC + encodeurs | Propulsion + odométrie |
+| 4× VL53L0X (ToF) | Détection murs (2 frontaux, 2 latéraux à 45°) |
+| MPU6050 | Gyroscope (vérification rotation) |
+| MCP23017 | Expandeur GPIO (XSHUT VL53L0X, LEDs) |
+| 3× LEDs (R/J/V) | Indication d'état |
+
+---
 
 ## Architecture logicielle
 
 ```
 src/
-  main.cpp          <- Machine d'etats principale
-  config.h          <- Toutes les constantes
-  mcp_io.h/.cpp     <- Wrapper MCP23017
-  sensors.h/.cpp    <- VL53L0X + filtre de Kalman
-  imu.h/.cpp        <- MPU6050 gyroscope
-  encoders.h/.cpp   <- ISR + comptage ticks
-  motors.h/.cpp     <- PWM + direction
-  pid.h/.cpp        <- Correcteur discret en Z
-  maze.h/.cpp       <- Grille 5x5 + memoire murs
-  tremaux.h/.cpp    <- Algorithme exploration
-  bfs.h/.cpp        <- Algorithme chemin optimal
-  navigation.h/.cpp <- Primitives de mouvement
-  leds.h/.cpp       <- Patterns LED
-  web_ui.h/.cpp     <- IHM web embarquee
-  diagnostic.h/.cpp <- Tests hardware au boot
+  main.cpp            <- Machine d'états principale
+  config.h            <- Toutes les constantes (pinout, PID, paramètres)
+  motors.h/.cpp       <- PWM + direction + freinage
+  pid.h/.cpp          <- Correcteurs PID discrets en Z (encodeurs + ToF + pivot)
+  navigation.h/.cpp   <- Primitives de mouvement (avance, pivot 90°, virage 45°)
+  wall_follower.h/.cpp<- Suivi de mur latéral ToF
+  maze.h/.cpp         <- Grille 5×5 + mémoire des murs (bitmask)
+  tremaux.h/.cpp      <- Algorithme Trémaux (Run 1)
+  imu.h/.cpp          <- MPU6050 gyroscope
+  calibration.h/.cpp  <- Calibration capteurs + PID persistée en LittleFS
+  web_ui.h/.cpp       <- IHM web embarquée (carte SVG, tuning PID, arrêt urgence)
 ```
 
-## IHM Web embarquee
+---
 
-Le robot cree un point d'acces WiFi. Se connecter a `Robot_Laby_Eq17` (mdp: `icam2026`) puis ouvrir `http://192.168.4.1`.
+## IHM Web embarquée
 
-**Fonctionnalites :**
-- Dashboard avec etat du robot et diagnostic hardware
-- Capteurs en temps reel (ToF, gyroscope, encodeurs)
-- Tuning PID en direct (sliders Kp/Ki/Kd) avec assistant de reglage guide
-- Carte du labyrinthe en SVG avec mapping en temps reel
-- Boutons Start Run 1 / Start Run 2 / Arret d'urgence
+Le robot crée un point d'accès WiFi.  
+Se connecter à **`Robot_Laby_Eq17`** (mdp : `icam2026`) puis ouvrir **`http://192.168.4.1`**.
+
+- Carte du labyrinthe en SVG avec mapping en temps réel
+- Capteurs en temps réel (ToF, gyroscope, encodeurs)
+- Tuning PID en direct (Kp/Ki/Kd encodeurs, ToF, pivot)
+- Calibration des seuils ToF (mur, ouverture, poteau)
+- Boutons Start Run 1 / Start Run 2 / Arrêt d'urgence
+
+---
 
 ## Asservissement
 
-### PID vitesse moteur (transformee en Z)
-Correcteur discret echantillonne a 50Hz. Chaque roue a sa propre boucle PID.
-```
-H(z) = Kp + Ki*Ts/(1 - z^-1) + Kd*(1 - z^-1)/Ts
-```
+### PID vitesse moteur (transformée en Z)
+Correcteur discret échantillonné à 50 Hz. Chaque roue a sa propre boucle PID.
 
-### PID correction laterale
-Centre le robot dans le couloir en utilisant l'erreur entre les ToF lateraux a 45 deg.
+### PID correction latérale (ToF)
+Centre le robot dans le couloir via l'erreur entre les capteurs ToF latéraux à 45°.
+
+### PID pivot
+Contrôle la précision des rotations 90° à partir des encodeurs.
 
 ### Filtre de Kalman 1D
-Applique sur chaque capteur ToF pour lisser les perturbations dues aux poteaux du labyrinthe (~10-15mm de large).
+Appliqué sur chaque capteur ToF pour lisser les perturbations dues aux poteaux (~10–15 mm).
 
-## Phases de developpement
+---
+
+## État d'avancement (soutenance — avril 2026)
 
 | Phase | Description | Statut |
 |-------|-------------|--------|
-| 1 | Diagnostic hardware (I2C, capteurs, moteurs) | En cours |
-| 2 | IHM web + moteurs + PID moteur | A faire |
-| 3 | Navigation case par case + Kalman + auto-calage | A faire |
-| 4 | Tremaux + carte live IHM | A faire |
-| 5 | BFS + trajectoire cloche Run 2 | A faire |
-| 6 | Integration + tuning final | A faire |
+| 1 | I2C + MCP23017 + VL53L0X (adressage XSHUT dynamique) | ✅ Fait |
+| 2 | MPU6050 — lecture cap + détection rotation 90° | ✅ Fait |
+| 3 | Encodeurs + moteurs + avance en ligne droite | ✅ Fait |
+| 4 | PID latéral ToF + PID pivot 90° | ✅ Fait |
+| 5 | Trémaux sur labyrinthe physique | 🔄 En cours |
+| 6 | BFS + exécution chemin Run 2 | 🔜 À faire |
+| 7 | IHM WiFi — carte SVG + calibration + arrêt urgence | ✅ Fait |
+| 8 | Intégration complète + tuning | 🔜 À faire |
+
+---
 
 ## Build & Flash
 
 ```bash
-# Prerequis : PlatformIO CLI ou VS Code + extension PlatformIO
-# Brancher le NodeMCU en USB
+# Prérequis : PlatformIO CLI ou VS Code + extension PlatformIO
 
 # Compiler
 pio run
@@ -94,14 +104,12 @@ pio run
 # Flasher
 pio run --target upload
 
-# Moniteur serie
+# Moniteur série
 pio device monitor -b 115200
 ```
 
-## Specification technique
-
-Le document de specification complet est disponible dans [`docs/superpowers/specs/2026-04-12-mazebot-software-design.md`](docs/superpowers/specs/2026-04-12-mazebot-software-design.md).
+---
 
 ## Licence
 
-Projet academique ICAM Strasbourg Europe — Equipe 17.
+Projet académique — ICAM Strasbourg Europe — Équipe 17.
