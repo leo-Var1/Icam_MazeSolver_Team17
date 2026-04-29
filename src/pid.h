@@ -42,3 +42,20 @@ void pid_update(long ticks_left, long ticks_right, int pwm_base,
 void pid_update_tof(float side_left_mm, float side_right_mm,
                     int opening_l_mm, int opening_r_mm,
                     int pwm_base, int& pwm_left, int& pwm_right);
+
+// ── Toggle PID latéral pour debug ────────────────────────────
+// Quand désactivé, pid_update_tof() retourne pwm_base sans correction.
+// Permet de tester si la dérive vient du PID lateral ou d'autre chose.
+void pid_tof_set_enabled(bool enabled);
+bool pid_tof_is_enabled();
+
+// ── pid_update_pivot ──────────────────────────────────────────
+// PID dédié au pivot sur place : force |ticks_L| ≈ |ticks_R| pour que
+// le robot pivote autour de son centre (et non d'une roue stallée).
+// Erreur = |ticks_left| - |ticks_right|.
+//   direction : +1 = droite (gauche avant, droite arrière)
+//               -1 = gauche (gauche arrière, droite avant)
+//   pwm_base  : PWM commun symétrique (≈ vitesse de pivot voulue)
+//   pwm_left, pwm_right : [sortie] PWM signés à appliquer via motors_set()
+void pid_update_pivot(long ticks_left, long ticks_right, int direction,
+                      int pwm_base, int& pwm_left, int& pwm_right);

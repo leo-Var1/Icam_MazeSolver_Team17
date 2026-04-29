@@ -49,7 +49,7 @@
 #define MCP_LED_GREEN   10   // GPB2 (pin MCP = 8+2 = 10) — succès / idle
 
 // ── Moteurs : PWM ─────────────────────────────────────────────
-#define PWM_RUN1        65   // ~25% — vitesse exploration
+#define PWM_RUN1        80   // ~31% — vitesse exploration (couple ok, PID stable)
 #define PWM_RUN2        230  // ~90% — vitesse résolution
 
 // ── Labyrinthe ────────────────────────────────────────────────
@@ -68,11 +68,11 @@
 // KP faible : évite les oscillations (mesure en mm bruitée)
 // KD élevé  : amortit les oscillations
 // KI minimal : évite le windup (dérive lente vers un côté)
-#define PID_TOF_KP      0.3f
-#define PID_TOF_KI      0.002f
-#define PID_TOF_KD      0.8f
-// Cap de correction : empêche un moteur d'accélérer trop au-dessus de la base
-#define PID_TOF_MAX_CORR  20
+#define PID_TOF_KP      0.15f   // ↑ correction proportionnelle plus marquée
+#define PID_TOF_KI      0.001f
+#define PID_TOF_KD      0.5f    // ↓ moins sensible au bruit ToF (5-10mm cycle à cycle)
+// Cap de correction : permet de récupérer après un smooth turn (biais ~50mm)
+#define PID_TOF_MAX_CORR  25
 
 // ── WiFi Access Point ─────────────────────────────────────────
 #define WIFI_SSID       "Robot_Laby_Eq17"
@@ -107,42 +107,74 @@
 #define TICKS_PER_CELL      245     // 200mm = 1 case
 
 // ── Navigation ────────────────────────────────────────────────
-// Virage : PWM asymétriques pour compenser le frottement statique.
-// La roue intérieure (arrière) a besoin de plus de couple pour vaincre
-// le frottement statique que la roue extérieure (avant).
-#define PWM_TURN            90   // roue extérieure (avant) — valeur nominale
-#define PWM_TURN_INNER      150  // roue intérieure (arrière) — plus fort : vainc le frottement
-#define PWM_TURN_SLOW       50   // non utilisé actuellement
+// (Les PWM de pivot sont définis plus bas dans la section "pivot 90°/180°".)
 // PWM faible pour les micro-corrections (auto-alignement, diagnostic)
 #define PWM_DIAG            40
 
-// ── Rotation — virage décomposé 45° + cross + 45° ────────────
-// Cinématique : pivot 45° → avance courte (recalage sur poteau) → pivot 45°
-// Le 180° reste un pivot continu (pas de décomposition cross).
+// ── PID pivot (force |ticks_L| ≈ |ticks_R| pendant rotation sur place) ──
+// Erreur = labs(ticks_L) - labs(ticks_R) → correction symétrique des magnitudes
+// PWM : on accélère la roue lente, on freine la roue rapide.
+// PWM minimum garanti pour ne pas staller (vaincre frottement statique).
+#define PID_PIVOT_KP        1.5f
+#define PID_PIVOT_KI        0.04f
+#define PID_PIVOT_KD        0.6f
+#define PID_PIVOT_MAX_CORR  35     // cap correction (PWM units)
+#define PID_PIVOT_MIN_PWM   75     // plancher PWM (au-dessus du seuil de stall)
+
+// ── Rotation — pivot sur place 90° et 180° ───────────────────
+// Cinématique : les 2 roues tournent en sens opposés autour du centre
+// du robot. Le PID pivot équilibre |ticks_L| ≈ |ticks_R|.
 //
-// Ticks pour 45° :
-//   arc = (PI/4) × (WHEEL_BASE/2) = 0.7854 × 62.5 ≈ 49mm → 49 × 1.40 ≈ 69
-//   En pratique les roues glissent → valeur à ajuster sur le robot réel.
-#define TICKS_PER_45DEG     62
+// RÉFÉRENCE PRIMAIRE D'ARRÊT : ticks encodeur (plus précis que l'IMU).
+// L'IMU sert de garde-fou : si l'angle dépasse IMU_PIVOT_TARGET avant les
+// ticks, on stoppe quand même (problème de glissement → log d'alerte).
+//
+// Calcul théorique des ticks pour 90° :
+//   arc roue = (π/2) × (WHEEL_BASE/2) = 1.5708 × 62.5 ≈ 98 mm
+//   ticks   = 98 × TICKS_PER_MM = 98 × 1.40 ≈ 137 ticks
+// En pratique le glissement augmente cette valeur (typiquement 150-170).
+// → Ajustable en direct via l'IHM (calib_get_pivot_90_ticks()).
+#define TICKS_PIVOT_90        137     // défaut — à régler physiquement
+#define TICKS_PIVOT_45_R      63      // Virage 45° Droite (réduit de 69)
+#define TICKS_PIVOT_45_L      60      // Virage 45° Gauche (réduit de 66)
+#define TICKS_PIVOT_180       274     // ≈ 2 × TICKS_PIVOT_90
 
-// Décélération fin de pivot (anti-dépassement) :
-//   À TURN_DECEL_PCT% des ticks, on réduit progressivement le PWM.
-//   Rampe linéaire : outer PWM_TURN → PWM_TURN_DECEL_OUTER, inner → PWM_TURN_DECEL_INNER
-#define TURN_DECEL_PCT          78   // commence la décel à 78% du pivot
-#define PWM_TURN_DECEL_OUTER    45   // PWM outer en toute fin de pivot
-#define PWM_TURN_DECEL_INNER    85   // PWM inner en toute fin de pivot
 
-// Phase "cross" : avance entre les deux demi-pivots (~70mm).
-//   70mm × 1.40 ≈ 98 ticks. Stoppée plus tôt si poteau détecté.
-#define TURN_CROSS_TICKS    98
-#define TURN_CROSS_PWM      55
+// ── Mouvement spécial 45-40-45 ───────────────────────────────
+#define TICKS_SPECIAL_MOVE    98      // 70mm * 1.4 ticks/mm
 
-// Seuil de détection poteau (valeur par défaut — ajustable via calibration IHM).
-// Remplacé dynamiquement par calib_get_post_detect() pendant la phase cross.
-#define TOF_POST_DETECT_MM  40
+// Distance frontale cible pour se caler au milieu de la case en fin de smooth turn
+#define SMOOTH_CENTER_TARGET_MM   77
+// Tolérance d'arrêt sur la distance cible (±mm)
+#define SMOOTH_CENTER_TOL_MM      4
+// PWM min/max pour la phase de centrage (au-dessus du stall, sous PWM_RUN1)
+#define SMOOTH_CENTER_PWM_MIN     65
+#define SMOOTH_CENTER_PWM_MAX     90
 
-// Délai de stabilisation avant chaque pivot (ms)
-#define TURN_SETTLE_MS      80
+// Garde-fou IMU : stop forcé si l'angle dépasse cette cible AVANT les ticks
+// (cas pathologique : roues qui glissent énormément).
+// Cible LARGE pour ne pas couper la rotation prématurément quand l'utilisateur
+// augmente les ticks de calibration (sinon on plafonne à ~90°/180° côté IMU).
+#define IMU_PIVOT_TARGET      120.0f   // marge large : 30° de tolérance au-delà de 90°
+#define IMU_PIVOT_180_TARGET  220.0f   // idem pour le 180°
+
+// Rampe linéaire de décélération :
+//   À PIVOT_DECEL_PCT% des ticks, on commence à interpoler PWM_PIVOT_FAST
+//   vers PWM_PIVOT_SLOW (linéaire jusqu'à 100% des ticks).
+#define PIVOT_DECEL_PCT       50      // début de la rampe à 50% des ticks
+#define PWM_PIVOT_FAST        110     // PWM phase rapide (vainc frottement)
+#define PWM_PIVOT_SLOW        75      // PWM fin de rampe (juste > stall)
+
+// Délai de stabilisation avant chaque rotation (ms)
+#define TURN_SETTLE_MS        80
+
+// Pause entre 2 cases dans Trémaux (laisse le temps de stabiliser + lire ToF propre)
+#define TREM_PAUSE_MS         600
+
+// Marge de stricte main droite : pour considérer le passage à droite ouvert,
+// la lecture SR doit dépasser opening_r de cette marge (en mm). Évite que
+// le wall_follower colle au mur droit en tournant dès la moindre bosse.
+#define WF_RIGHT_MARGIN_MM    25
 
 // ── Snapshot détection murs (capteurs à 45°) ─────────────────
 // Valeur en % de TICKS_PER_CELL (40% = milieu de la case).
@@ -163,8 +195,20 @@
 #define TOF_STOP_FRONT_MM   60
 // Distance cible pour l'auto-alignement frontal
 #define TOF_ALIGN_TARGET_MM 40
-// Tolérance d'alignement FL vs FR (en mm)
-#define TOF_ALIGN_TOL_MM    2
+// Tolérance d'alignement FL vs FR (en mm) — ancien auto-align
+#define TOF_ALIGN_TOL_MM    5
+// Tolérance distance translation
+#define ALIGN_DIST_TOL_MM   8
+
+
+// ── Pré-alignement avant pivot (mode bang-bang) ──────────────
+// PWM_DIAG (40) est sous le seuil de décrochage → la roue ne démarre pas et
+// quand elle finit par bouger, elle dépasse. On utilise un PWM constant
+// au-dessus du seuil de stall avec tolérances larges pour éviter le hunting.
+#define PWM_ALIGN_TURN          80   // PWM rotation pré-align (au-dessus stall)
+#define PWM_ALIGN_MOVE          95   // PWM avance pré-align (vainc frottement)
+#define ALIGN_ANGLE_TOL_MM      5    // tolérance |FL - FR|
+#define ALIGN_DIST_TOL_MM       8    // tolérance |avg_dist - target|
 
 // Marge de rejet géométrique capteurs latéraux à 45°.
 // Un mur frontal à distance d projette sur le capteur 45° à d × √2.

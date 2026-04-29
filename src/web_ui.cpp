@@ -38,7 +38,8 @@ static WebState s_state = { 0, 0.0f, 0, 0, 0, 0 };
 
 // ── File de commande (simple flag, 1 seule en vol) ────────────
 // volatile car modifié depuis un contexte async.
-static volatile WebCmd s_pending_cmd = WEB_CMD_NONE;
+static volatile WebCmd s_pending_cmd    = WEB_CMD_NONE;
+static volatile int    s_pending_value  = 0;  // valeur associée à la commande (ex: ticks)
 
 // ── Target (arrivée) et Start (départ) ────────────────────────
 // Par défaut : départ (0,0) coin haut-gauche, arrivée (4,4) coin bas-droit.
@@ -46,6 +47,7 @@ static volatile uint8_t s_target_row = MAZE_SIZE - 1;
 static volatile uint8_t s_target_col = MAZE_SIZE - 1;
 static volatile uint8_t s_start_row  = 0;
 static volatile uint8_t s_start_col  = 0;
+static volatile uint8_t s_start_dir  = 0;  // 0=N, 1=E, 2=S, 3=W
 
 // =============================================================
 //  Page HTML embarquée en PROGMEM
@@ -77,6 +79,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .mode-btn{flex:1;padding:8px 6px;border:2px solid #555;background:#333;color:#aaa;border-radius:4px;cursor:pointer;font-size:12px;text-align:center;}
   .mode-btn.active-start{border-color:#3498db;background:#002244;color:#3498db;}
   .mode-btn.active-target{border-color:#f39c12;background:#4a3800;color:#f39c12;}
+  .dir-btn{padding:4px 8px;background:#333;border:1px solid #555;color:#aaa;border-radius:3px;cursor:pointer;font-size:12px;}
+  .dir-btn.active{border-color:#3498db;background:#002244;color:#3498db;}
   /* Boutons */
   .btn{background:#3a3a3a;color:#eee;border:1px solid #555;padding:9px 14px;border-radius:4px;margin:3px;cursor:pointer;font-size:13px;}
   .btn:hover:not(:disabled){background:#4a4a4a;}
@@ -121,6 +125,13 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         Poser ARRIVEE
       </div>
     </div>
+    <div style="display:flex;gap:4px;margin-bottom:6px;font-size:12px;align-items:center;">
+      <span style="color:#888;">Orientation départ :</span>
+      <button class="dir-btn" id="dir-N" onclick="setDir(0)">▲ N</button>
+      <button class="dir-btn" id="dir-E" onclick="setDir(1)">▶ E</button>
+      <button class="dir-btn" id="dir-S" onclick="setDir(2)">▼ S</button>
+      <button class="dir-btn" id="dir-W" onclick="setDir(3)">◀ W</button>
+    </div>
     <svg id="grid" width="340" height="340" viewBox="-2 -2 344 344"></svg>
     <div id="maze-legend" style="font-size:11px;color:#888;margin-top:4px;">
       <span style="color:#1a5c1a;">&#9632;</span> Visitée &nbsp;
@@ -147,19 +158,30 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
     <hr>
     <div class="btn-row">
-      <button class="btn run" id="btn-r1" onclick="cmd('start1')">▶ Run 1 — Trémaux</button>
+      <button class="btn run" id="btn-r1" onclick="cmd('start1')" style="font-size:15px;padding:12px 18px;width:100%;">▶ Lancer Tremaux (Run 1)</button>
+    </div>
+    <div class="btn-row">
       <button class="btn run" id="btn-r2" onclick="cmd('start2')">▶ Run 2 — BFS</button>
     </div>
     <div class="btn-row">
+      <button class="btn run" id="btn-wallr" onclick="cmd('start_wall_r')"
+              style="background:#1a3a4a;border-color:#3498db;color:#a3d9ec;">▶ Main Droite (fallback)</button>
+    </div>
+    <div class="btn-row">
       <button class="btn stop" onclick="cmd('stop')">■ STOP urgence</button>
+      <button class="btn" id="btn-reset" onclick="cmd('reset')" style="display:none;background:#3a2a00;border-color:#f39c12;color:#f8d57e;">↺ Reset → IDLE</button>
     </div>
     <hr>
-    <div class="hint">Contrôle manuel (IDLE uniquement)</div>
+    <div class="hint">Manuel (IDLE) — clics ou touches clavier ↑↓←→ / Espace=stop</div>
     <div class="dpad">
-      <button class="btn up"    onclick="move('up')">▲</button>
-      <button class="btn left"  onclick="move('left')">◀</button>
-      <button class="btn down"  onclick="move('down')">▼</button>
-      <button class="btn right" onclick="move('right')">▶</button>
+      <button class="btn up"    id="dpad-up"    onclick="move('up')">▲</button>
+      <button class="btn left"  id="dpad-left"  onclick="move('left')">◀</button>
+      <button class="btn down"  id="dpad-down"  onclick="move('down')">▼</button>
+      <button class="btn right" id="dpad-right" onclick="move('right')">▶</button>
+    </div>
+    <div class="btn-row" style="margin-top:10px;">
+      <button class="btn" onclick="move('smooth_l')" style="background:#2c3e50;flex:1;">Smooth ◀</button>
+      <button class="btn" onclick="move('smooth_r')" style="background:#2c3e50;flex:1;">Smooth ▶</button>
     </div>
   </div>
 
@@ -170,6 +192,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="info-row"><span class="lbl">TURN    :</span><span id="cal-turn">—</span> mm</div>
     <div class="info-row"><span class="lbl">OPEN L  :</span><span id="cal-ol">—</span> mm</div>
     <div class="info-row"><span class="lbl">OPEN R  :</span><span id="cal-or">—</span> mm</div>
+    <div class="info-row"><span class="lbl">WALL L  :</span><span id="cal-wl">—</span> mm</div>
+    <div class="info-row"><span class="lbl">WALL R  :</span><span id="cal-wr">—</span> mm</div>
     <div class="info-row"><span class="lbl">POTEAU  :</span><span id="cal-post">—</span> mm</div>
     <hr>
     <div class="btn-row">
@@ -177,12 +201,119 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <button class="btn" id="btn-cal-t"   onclick="cal('turn')">Capturer TURN</button>
       <button class="btn" id="btn-cal-ol"  onclick="cal('opening_l')">Capturer OPEN L</button>
       <button class="btn" id="btn-cal-or"  onclick="cal('opening_r')">Capturer OPEN R</button>
+      <button class="btn" id="btn-cal-wl"  onclick="cal('wall_l')">Capturer MUR G</button>
+      <button class="btn" id="btn-cal-wr"  onclick="cal('wall_r')">Capturer MUR D</button>
       <button class="btn" id="btn-cal-post" onclick="cal('post')">Capturer POTEAU</button>
     </div>
+    <hr>
+    <div style="font-size:12px;color:#888;margin-bottom:4px;">Réglages encodeurs (ticks) :</div>
+    <div class="info-row" style="display:flex;align-items:center;gap:6px;">
+      <span class="lbl" style="min-width:70px;">PIVOT 90°</span>
+      <input id="in-piv" type="number" min="30" max="600" step="1"
+             style="width:65px;background:#1e1e1e;color:#eee;border:1px solid #555;padding:3px;border-radius:3px;font-family:monospace;">
+      <button class="btn" id="btn-set-piv" style="padding:4px 10px;margin:0;" onclick="setCalib('set_pivot_90','in-piv')">OK</button>
+    </div>
+    <div class="info-row" style="display:flex;align-items:center;gap:6px;">
+      <span class="lbl" style="min-width:70px;">CASE</span>
+      <input id="in-cell" type="number" min="50" max="800" step="1"
+             style="width:65px;background:#1e1e1e;color:#eee;border:1px solid #555;padding:3px;border-radius:3px;font-family:monospace;">
+      <button class="btn" id="btn-set-cell" style="padding:4px 10px;margin:0;" onclick="setCalib('set_cell','in-cell')">OK</button>
+    </div>
+    <hr>
+    <div style="font-size:12px;color:#888;margin-bottom:4px;">Smooth turn (45-avance-45-centre) :</div>
+    <div class="info-row" style="display:flex;align-items:center;gap:6px;">
+      <span class="lbl" style="min-width:70px;">PIV 45 D</span>
+      <input id="in-piv45r" type="number" min="20" max="200" step="1"
+             style="width:65px;background:#1e1e1e;color:#eee;border:1px solid #555;padding:3px;border-radius:3px;font-family:monospace;">
+      <button class="btn" id="btn-set-piv45r" style="padding:4px 10px;margin:0;" onclick="setCalib('set_piv45_r','in-piv45r')">OK</button>
+    </div>
+    <div class="info-row" style="display:flex;align-items:center;gap:6px;">
+      <span class="lbl" style="min-width:70px;">PIV 45 G</span>
+      <input id="in-piv45l" type="number" min="20" max="200" step="1"
+             style="width:65px;background:#1e1e1e;color:#eee;border:1px solid #555;padding:3px;border-radius:3px;font-family:monospace;">
+      <button class="btn" id="btn-set-piv45l" style="padding:4px 10px;margin:0;" onclick="setCalib('set_piv45_l','in-piv45l')">OK</button>
+    </div>
+    <div class="info-row" style="display:flex;align-items:center;gap:6px;">
+      <span class="lbl" style="min-width:70px;">AVANCE</span>
+      <input id="in-smove" type="number" min="20" max="400" step="1"
+             style="width:65px;background:#1e1e1e;color:#eee;border:1px solid #555;padding:3px;border-radius:3px;font-family:monospace;">
+      <button class="btn" id="btn-set-smove" style="padding:4px 10px;margin:0;" onclick="setCalib('set_smooth_move','in-smove')">OK</button>
+      <span style="font-size:10px;color:#666;">ticks</span>
+    </div>
+    <div class="info-row" style="display:flex;align-items:center;gap:6px;">
+      <span class="lbl" style="min-width:70px;">CENTRE</span>
+      <input id="in-scenter" type="number" min="30" max="200" step="1"
+             style="width:65px;background:#1e1e1e;color:#eee;border:1px solid #555;padding:3px;border-radius:3px;font-family:monospace;">
+      <button class="btn" id="btn-set-scenter" style="padding:4px 10px;margin:0;" onclick="setCalib('set_smooth_center','in-scenter')">OK</button>
+      <span style="font-size:10px;color:#666;">mm</span>
+    </div>
+    <hr>
     <div class="btn-row">
       <button class="btn stop" id="btn-cal-rst" onclick="cal('reset')">Reset defauts</button>
     </div>
-    <div class="hint">IDLE uniquement. Placer le robot pres du poteau puis cliquer POTEAU. ~400ms.</div>
+    <div class="hint">IDLE uniquement. MUR G/D : robot dans couloir avec murs des 2 cotes. POTEAU : a cote d'un poteau alu. ~400ms.</div>
+  </div>
+
+  <!-- Panneau PID -->
+  <div class="panel" style="min-width:300px;">
+    <h1 style="margin-top:0;">Tuning PID Live</h1>
+    
+    <div id="pid-sync" style="font-size:10px; color:#f39c12; height:12px; margin-bottom:4px; text-align:right;"></div>
+
+    <!-- PID Encodeurs -->
+    <div style="font-size:12px;color:#3498db;margin-bottom:8px;font-weight:bold;border-bottom:1px solid #333;padding-bottom:2px;">
+      PID Encodeurs (Synchro Roues)
+    </div>
+    <div class="pid-group">
+      <div class="info-row">
+        <span class="lbl" style="width:20px;">Kp</span>
+        <input id="sl-kp" type="range" min="0" max="10" step="0.1" oninput="updVal('kp')" onchange="sendVal('pid_kp',this.value)">
+        <span id="val-kp" class="tof-val" style="width:40px;display:inline-block">0</span>
+      </div>
+      <div class="info-row">
+        <span class="lbl" style="width:20px;">Ki</span>
+        <input id="sl-ki" type="range" min="0" max="1" step="0.005" oninput="updVal('ki')" onchange="sendVal('pid_ki',this.value)">
+        <span id="val-ki" class="tof-val" style="width:40px;display:inline-block">0</span>
+      </div>
+      <div class="info-row">
+        <span class="lbl" style="width:20px;">Kd</span>
+        <input id="sl-kd" type="range" min="0" max="5" step="0.05" oninput="updVal('kd')" onchange="sendVal('pid_kd',this.value)">
+        <span id="val-kd" class="tof-val" style="width:40px;display:inline-block">0</span>
+      </div>
+    </div>
+
+    <hr>
+    <!-- PID ToF -->
+    <div style="font-size:12px;color:#27ae60;margin-bottom:8px;font-weight:bold;border-bottom:1px solid #333;padding-bottom:2px;">
+      PID ToF (Centrage Murs)
+    </div>
+    <div class="pid-group">
+      <div class="info-row">
+        <span class="lbl" style="width:20px;">Kp</span>
+        <input id="sl-tkp" type="range" min="0" max="2" step="0.01" oninput="updVal('tkp')" onchange="sendVal('pid_tof_kp',this.value)">
+        <span id="val-tkp" class="tof-val" style="width:40px;display:inline-block">0</span>
+      </div>
+      <div class="info-row">
+        <span class="lbl" style="width:20px;">Ki</span>
+        <input id="sl-tki" type="range" min="0" max="0.1" step="0.001" oninput="updVal('tki')" onchange="sendVal('pid_tof_ki',this.value)">
+        <span id="val-tki" class="tof-val" style="width:40px;display:inline-block">0</span>
+      </div>
+      <div class="info-row">
+        <span class="lbl" style="width:20px;">Kd</span>
+        <input id="sl-tkd" type="range" min="0" max="2" step="0.01" oninput="updVal('tkd')" onchange="sendVal('pid_tof_kd',this.value)">
+        <span id="val-tkd" class="tof-val" style="width:40px;display:inline-block">0</span>
+      </div>
+    </div>
+
+    <hr>
+    <!-- Guide de réglage -->
+    <div style="background:#111; padding:8px; border-radius:4px; font-size:11px; color:#aaa; line-height:1.4;">
+      <b style="color:#eee;">Conseils de réglage :</b><br>
+      1. <b>Kp (Réaction) :</b> Augmenter jusqu'à ce que le robot oscille, puis baisser de 30%.<br>
+      2. <b>Kd (Amorti) :</b> Augmenter pour supprimer les oscillations du Kp.<br>
+      3. <b>Ki (Précision) :</b> À laisser très faible (0.001). Sert à corriger une dérive lente.<br>
+      <i style="color:#666; font-size:10px;">Le réglage est envoyé dès que vous relâchez le curseur.</i>
+    </div>
   </div>
 
 </div>
@@ -192,10 +323,11 @@ const N=5, SZ=64, PAD=10;
 const SVG=document.getElementById('grid');
 let mazeData=null, stateData=null;
 let target={r:4,c:4}, startPos={r:0,c:0};
+let startDir=0;  // 0=N,1=E,2=S,3=W
 let mode='start';  // 'start' ou 'target'
 
-const STATE_NAMES=['IDLE','RUN1-Trémaux','CARTE OK','RUN2-BFS','TERMINÉ','URGENCE'];
-const STATE_CLS  =['s0','s1','s2','s3','s4','s5'];
+const STATE_NAMES=['IDLE','RUN1-Trémaux','CARTE OK','RUN2-BFS','TERMINÉ','URGENCE','MAIN DROITE'];
+const STATE_CLS  =['s0','s1','s2','s3','s4','s5','s1'];
 
 function setMode(m){
   mode=m;
@@ -203,6 +335,20 @@ function setMode(m){
     'mode-btn' + (m==='start' ?' active-start':'');
   document.getElementById('btn-mode-target').className =
     'mode-btn' + (m==='target'?' active-target':'');
+}
+
+function refreshDirButtons(){
+  ['N','E','S','W'].forEach((k,i)=>{
+    const el=document.getElementById('dir-'+k);
+    if(el) el.className='dir-btn'+(i===startDir?' active':'');
+  });
+}
+function setDir(d){
+  startDir=d;
+  refreshDirButtons();
+  // POST sans bouger la position : on conserve startPos
+  fetch('/start_pos',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({row:startPos.r,col:startPos.c,dir:d})});
 }
 
 function buildGrid(){
@@ -228,7 +374,7 @@ function cellClick(r,c){
     const el=document.getElementById(`c${r}_${c}`);
     if(el) el.classList.add('startpos');
     fetch('/start_pos',{method:'POST',headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({row:r,col:c})});
+          body:JSON.stringify({row:r,col:c,dir:startDir})});
   } else {
     // Efface l'ancienne case arrivée
     const old=document.getElementById(`c${target.r}_${target.c}`);
@@ -294,23 +440,66 @@ function updateInfo(st){
 
   // Sync target/start depuis server si dispo
   if(st.target){ target={r:st.target.row, c:st.target.col}; }
-  if(st.startpos){ startPos={r:st.startpos.row, c:st.startpos.col}; }
+  if(st.startpos){
+    startPos={r:st.startpos.row, c:st.startpos.col};
+    if(typeof st.startpos.dir==='number' && st.startpos.dir!==startDir){
+      startDir=st.startpos.dir;
+      refreshDirButtons();
+    }
+  }
   document.getElementById('s-start').textContent=`(${startPos.r}, ${startPos.c})`;
   document.getElementById('s-target').textContent=`(${target.r}, ${target.c})`;
 
-  // Griser run2 si pas en IDLE/MAZE_OK
-  const canRun = (i===0||i===2);
-  document.getElementById('btn-r1').disabled = !canRun;
+  // Run1 accessible depuis IDLE, MAZE_OK ou EMERGENCY (relance)
+  const canRun1 = (i===0||i===2||i===5);
+  document.getElementById('btn-r1').disabled = !canRun1;
   document.getElementById('btn-r2').disabled = (i!==2);
+  // Main droite : depuis IDLE ou EMERGENCY
+  const canWallR = (i===0||i===5);
+  const bWR = document.getElementById('btn-wallr');
+  if(bWR) bWR.disabled = !canWallR;
+  // Bouton Reset visible uniquement en EMERGENCY (state 5)
+  document.getElementById('btn-reset').style.display = (i===5)?'inline-block':'none';
 
   // Calibration : uniquement en IDLE (state 0)
   const idle = (i===0);
-  ['btn-cal-c','btn-cal-t','btn-cal-ol','btn-cal-or','btn-cal-post','btn-cal-rst']
-    .forEach(id => document.getElementById(id).disabled = !idle);
+  ['btn-cal-c','btn-cal-t','btn-cal-ol','btn-cal-or','btn-cal-wl','btn-cal-wr','btn-cal-post','btn-cal-rst',
+   'btn-set-piv','btn-set-cell','btn-set-piv45r','btn-set-piv45l','btn-set-smove','btn-set-scenter']
+    .forEach(id => { const el=document.getElementById(id); if(el) el.disabled = !idle; });
 }
 
 function cmd(what){ fetch('/'+what,{method:'POST'}); }
 function cal(what){ fetch('/calib/'+what,{method:'POST'}); }
+function setCalib(endpoint, inputId){
+  const v=parseInt(document.getElementById(inputId).value,10);
+  if(isNaN(v)) return;
+  fetch('/calib/'+endpoint,{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({v})});
+}
+
+function updVal(id) {
+  document.getElementById('val-'+id).textContent = document.getElementById('sl-'+id).value;
+}
+
+async function sendVal(endpoint, val) {
+  const sync = document.getElementById('pid-sync');
+  sync.textContent = 'Sync...';
+  try {
+    const r = await fetch('/calib/set_'+endpoint, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({v: parseFloat(val)})
+    });
+    if (r.ok) {
+      sync.textContent = 'OK';
+      setTimeout(() => { if(sync.textContent==='OK') sync.textContent=''; }, 1000);
+    } else {
+      sync.textContent = 'Erreur';
+    }
+  } catch(e) {
+    sync.textContent = 'Erreur réseau';
+  }
+}
 
 async function pollCalib(){
   try{
@@ -319,7 +508,37 @@ async function pollCalib(){
     document.getElementById('cal-turn').textContent=c.turn;
     document.getElementById('cal-ol').textContent=c.opening_l;
     document.getElementById('cal-or').textContent=c.opening_r;
+    document.getElementById('cal-wl').textContent=c.wall_l;
+    document.getElementById('cal-wr').textContent=c.wall_r;
     document.getElementById('cal-post').textContent=c.post_detect;
+
+    const setIfIdle=(id,val)=>{
+      const el=document.getElementById(id);
+      if(el && document.activeElement!==el) el.value=val;
+    };
+    const setSl=(id,val)=>{
+      const sl=document.getElementById('sl-'+id);
+      if(sl && document.activeElement!==sl) {
+        sl.value=val;
+        const vdisplay = document.getElementById('val-'+id);
+        if(vdisplay) vdisplay.textContent=val;
+      }
+    };
+
+    setIfIdle('in-piv',     c.pivot_90_ticks);
+    setIfIdle('in-cell',    c.cell_ticks);
+    setIfIdle('in-piv45r',  c.pivot_45_r);
+    setIfIdle('in-piv45l',  c.pivot_45_l);
+    setIfIdle('in-smove',   c.smooth_move);
+    setIfIdle('in-scenter', c.smooth_center);
+
+    // Sync sliders
+    setSl('kp',  c.pid_kp);
+    setSl('ki',  c.pid_ki);
+    setSl('kd',  c.pid_kd);
+    setSl('tkp', c.pid_tof_kp);
+    setSl('tki', c.pid_tof_ki);
+    setSl('tkd', c.pid_tof_kd);
   } catch(e){ console.warn('calib poll',e); }
 }
 
@@ -346,7 +565,30 @@ async function pollMaze(){
   } catch(e){ console.warn('maze poll',e); }
 }
 
+// ── Raccourcis clavier ────────────────────────────────────────
+// Flèches = contrôle manuel, Espace = stop urgence, T = lancer Trémaux
+document.addEventListener('keydown', function(e){
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
+  switch(e.key){
+    case 'ArrowUp':    e.preventDefault(); move('up');    flash('dpad-up');    break;
+    case 'ArrowDown':  e.preventDefault(); move('down');  flash('dpad-down');  break;
+    case 'ArrowLeft':  e.preventDefault(); move('left');  flash('dpad-left');  break;
+    case 'ArrowRight': e.preventDefault(); move('right'); flash('dpad-right'); break;
+    case ' ':          e.preventDefault(); cmd('stop');   break;
+    case 't': case 'T':
+      if(!document.getElementById('btn-r1').disabled){ cmd('start1'); }
+      break;
+  }
+});
+function flash(id){
+  const el=document.getElementById(id);
+  if(!el) return;
+  el.style.background='#555';
+  setTimeout(()=>el.style.background='',150);
+}
+
 buildGrid();
+refreshDirButtons();
 pollState();
 pollMaze();
 setInterval(pollState,500);
@@ -407,6 +649,7 @@ static void handle_state(AsyncWebServerRequest* req) {
     JsonObject sp = doc.createNestedObject("startpos");
     sp["row"] = s_start_row;
     sp["col"] = s_start_col;
+    sp["dir"] = s_start_dir;
 
     String out;
     serializeJson(doc, out);
@@ -435,6 +678,11 @@ static void handle_stop(AsyncWebServerRequest* req) {
     s_pending_cmd = WEB_CMD_STOP;
     req->send(200, "application/json", "{\"ok\":true}");
 }
+// POST /reset → retour IDLE depuis EMERGENCY
+static void handle_reset(AsyncWebServerRequest* req) {
+    s_pending_cmd = WEB_CMD_RESET_IDLE;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
 
 // POST /start1
 static void handle_start1(AsyncWebServerRequest* req) {
@@ -445,6 +693,12 @@ static void handle_start1(AsyncWebServerRequest* req) {
 // POST /start2
 static void handle_start2(AsyncWebServerRequest* req) {
     s_pending_cmd = WEB_CMD_START2;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /start_wall_r — lance l'algo main droite
+static void handle_start_wall_r(AsyncWebServerRequest* req) {
+    s_pending_cmd = WEB_CMD_START_WALL_R;
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -462,6 +716,8 @@ static void handle_move_body(AsyncWebServerRequest* req, uint8_t* data, size_t l
     else if (!strcmp(dir, "down"))  s_pending_cmd = WEB_CMD_MOVE_DOWN;
     else if (!strcmp(dir, "left"))  s_pending_cmd = WEB_CMD_MOVE_LEFT;
     else if (!strcmp(dir, "right")) s_pending_cmd = WEB_CMD_MOVE_RIGHT;
+    else if (!strcmp(dir, "smooth_l")) s_pending_cmd = WEB_CMD_SMOOTH_L;
+    else if (!strcmp(dir, "smooth_r")) s_pending_cmd = WEB_CMD_SMOOTH_R;
     else {
         req->send(400, "application/json", "{\"ok\":false,\"err\":\"dir\"}");
         return;
@@ -482,18 +738,29 @@ static void handle_target_body(AsyncWebServerRequest* req, uint8_t* data, size_t
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
-// POST /start_pos
+// POST /start_pos — body {row, col, dir?} (dir optionnel : 0=N,1=E,2=S,3=W)
 static void handle_start_pos_body(AsyncWebServerRequest* req, uint8_t* data, size_t len,
                                   size_t index, size_t total) {
     if (index != 0 || len != total) return;
-    uint8_t r, c;
-    if (!parse_row_col(data, len, r, c, req)) return;
-    s_start_row = r;
-    s_start_col = c;
-    // Met à jour la position robot dans le labyrinthe (conserve le facing actuel)
-    maze_set_pos(r, c, maze_get_dir());
+    StaticJsonDocument<96> doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"json\"}");
+        return;
+    }
+    int r = doc["row"] | -1;
+    int c = doc["col"] | -1;
+    int d = doc["dir"] | (int)s_start_dir;  // si absent : conserve la valeur actuelle
+    if (r < 0 || r >= MAZE_SIZE || c < 0 || c >= MAZE_SIZE || d < 0 || d > 3) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"range\"}");
+        return;
+    }
+    s_start_row = (uint8_t)r;
+    s_start_col = (uint8_t)c;
+    s_start_dir = (uint8_t)d;
+    maze_set_pos((uint8_t)r, (uint8_t)c, (uint8_t)d);
     Serial.print("[WEB] Départ → ("); Serial.print(r);
-    Serial.print(","); Serial.print(c); Serial.println(")");
+    Serial.print(","); Serial.print(c);
+    Serial.print(") facing="); Serial.println("NESW"[d]);
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -501,14 +768,33 @@ static void handle_start_pos_body(AsyncWebServerRequest* req, uint8_t* data, siz
 //  Handlers HTTP — Calibration
 // =============================================================
 
-// GET /calib → JSON des 5 seuils courants
+// GET /calib → JSON des seuils courants
 static void handle_calib_get(AsyncWebServerRequest* req) {
-    StaticJsonDocument<160> doc;
-    doc["center"]       = calib_get_center();
-    doc["turn"]         = calib_get_turn();
-    doc["opening_l"]    = calib_get_opening_l();
-    doc["opening_r"]    = calib_get_opening_r();
-    doc["post_detect"]  = calib_get_post_detect();
+    StaticJsonDocument<512> doc;
+    doc["center"]         = calib_get_center();
+    doc["turn"]           = calib_get_turn();
+    doc["opening_l"]      = calib_get_opening_l();
+    doc["opening_r"]      = calib_get_opening_r();
+    doc["post_detect"]    = calib_get_post_detect();
+    doc["wall_l"]         = calib_get_wall_l();
+    doc["wall_r"]         = calib_get_wall_r();
+    doc["pivot_90_ticks"] = calib_get_pivot_90_ticks();
+    doc["cell_ticks"]     = calib_get_cell_ticks();
+    doc["pivot_45_r"]     = calib_get_pivot_45_r();
+    doc["pivot_45_l"]     = calib_get_pivot_45_l();
+    doc["smooth_move"]    = calib_get_smooth_move();
+    doc["smooth_center"]  = calib_get_smooth_center();
+    doc["pid_kp"]         = calib_get_pid_kp();
+    doc["pid_ki"]         = calib_get_pid_ki();
+    doc["pid_kd"]         = calib_get_pid_kd();
+    doc["pid_tof_kp"]     = calib_get_pid_tof_kp();
+    doc["pid_tof_ki"]     = calib_get_pid_tof_ki();
+    doc["pid_tof_kd"]     = calib_get_pid_tof_kd();
+    doc["pid_tof_max_corr"] = calib_get_pid_tof_max_corr();
+    doc["pid_piv_kp"]     = calib_get_pid_piv_kp();
+    doc["pid_piv_ki"]     = calib_get_pid_piv_ki();
+    doc["pid_piv_kd"]     = calib_get_pid_piv_kd();
+    doc["pid_piv_max_corr"] = calib_get_pid_piv_max_corr();
     String out; serializeJson(doc, out);
     req->send(200, "application/json", out);
 }
@@ -543,6 +829,141 @@ static void handle_calib_post(AsyncWebServerRequest* req) {
     s_pending_cmd = WEB_CMD_CALIB_POST;
     req->send(200, "application/json", "{\"ok\":true}");
 }
+// POST /calib/wall_l → capture distance mur gauche
+static void handle_calib_wall_l(AsyncWebServerRequest* req) {
+    s_pending_cmd = WEB_CMD_CALIB_WALL_L;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+// POST /calib/wall_r → capture distance mur droit
+static void handle_calib_wall_r(AsyncWebServerRequest* req) {
+    s_pending_cmd = WEB_CMD_CALIB_WALL_R;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /calib/set_pivot_90 — body {v: ticks}
+static void handle_calib_set_pivot_90_body(AsyncWebServerRequest* req, uint8_t* data,
+                                            size_t len, size_t index, size_t total) {
+    if (index != 0 || len != total) return;
+    StaticJsonDocument<48> doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"json\"}");
+        return;
+    }
+    int v = doc["v"] | -1;
+    if (v < 30 || v > 600) {  // garde-fous (extrêmes plausibles)
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"range\"}");
+        return;
+    }
+    s_pending_value = v;
+    s_pending_cmd   = WEB_CMD_CALIB_SET_PIVOT_90;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /calib/set_cell — body {v: ticks}
+static void handle_calib_set_cell_body(AsyncWebServerRequest* req, uint8_t* data,
+                                        size_t len, size_t index, size_t total) {
+    if (index != 0 || len != total) return;
+    StaticJsonDocument<48> doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"json\"}");
+        return;
+    }
+    int v = doc["v"] | -1;
+    if (v < 50 || v > 800) {  // garde-fous
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"range\"}");
+        return;
+    }
+    s_pending_value = v;
+    s_pending_cmd   = WEB_CMD_CALIB_SET_CELL;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// Helper factorisé : parse {v} dans [vmin..vmax], pose cmd + valeur
+static void handle_set_int_body(AsyncWebServerRequest* req, uint8_t* data,
+                                 size_t len, size_t index, size_t total,
+                                 int vmin, int vmax, WebCmd cmd) {
+    if (index != 0 || len != total) return;
+    StaticJsonDocument<48> doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"json\"}");
+        return;
+    }
+    int v = doc["v"] | INT32_MIN;
+    if (v < vmin || v > vmax) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"range\"}");
+        return;
+    }
+    s_pending_value = v;
+    s_pending_cmd   = cmd;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handle_set_piv45_r_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_int_body(req, d, l, i, t, 20, 200, WEB_CMD_CALIB_SET_PIV45_R);
+}
+static void handle_set_piv45_l_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_int_body(req, d, l, i, t, 20, 200, WEB_CMD_CALIB_SET_PIV45_L);
+}
+static void handle_set_smooth_move_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_int_body(req, d, l, i, t, 20, 400, WEB_CMD_CALIB_SET_SMOOTH_MOVE);
+}
+static void handle_set_smooth_center_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_int_body(req, d, l, i, t, 30, 200, WEB_CMD_CALIB_SET_SMOOTH_CENTER);
+}
+
+// Helper pour les floats : on multiplie par 1000 pour passer dans l'int s_pending_value
+static void handle_set_float_body(AsyncWebServerRequest* req, uint8_t* data,
+                                 size_t len, size_t index, size_t total,
+                                 float vmin, float vmax, WebCmd cmd) {
+    if (index != 0 || len != total) return;
+    StaticJsonDocument<64> doc;
+    if (deserializeJson(doc, data, len)) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"json\"}");
+        return;
+    }
+    float v = doc["v"] | -1000.0f;
+    if (v < vmin || v > vmax) {
+        req->send(400, "application/json", "{\"ok\":false,\"err\":\"range\"}");
+        return;
+    }
+    s_pending_value = (int)(v * 1000.0f);
+    s_pending_cmd   = cmd;
+    req->send(200, "application/json", "{\"ok\":true}");
+}
+
+static void handle_set_pid_kp_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 20.0f, WEB_CMD_CALIB_SET_PID_KP);
+}
+static void handle_set_pid_ki_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 5.0f, WEB_CMD_CALIB_SET_PID_KI);
+}
+static void handle_set_pid_kd_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 10.0f, WEB_CMD_CALIB_SET_PID_KD);
+}
+static void handle_set_pid_tof_kp_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 5.0f, WEB_CMD_CALIB_SET_PID_TOF_KP);
+}
+static void handle_set_pid_tof_ki_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 1.0f, WEB_CMD_CALIB_SET_PID_TOF_KI);
+}
+static void handle_set_pid_tof_kd_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 5.0f, WEB_CMD_CALIB_SET_PID_TOF_KD);
+}
+static void handle_set_pid_tof_max_corr_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_int_body(req, d, l, i, t, 0, 100, WEB_CMD_CALIB_SET_PID_TOF_MAX_CORR);
+}
+static void handle_set_pid_piv_kp_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 20.0f, WEB_CMD_CALIB_SET_PID_PIV_KP);
+}
+static void handle_set_pid_piv_ki_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 5.0f, WEB_CMD_CALIB_SET_PID_PIV_KI);
+}
+static void handle_set_pid_piv_kd_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_float_body(req, d, l, i, t, 0.0f, 10.0f, WEB_CMD_CALIB_SET_PID_PIV_KD);
+}
+static void handle_set_pid_piv_max_corr_body(AsyncWebServerRequest* req, uint8_t* d, size_t l, size_t i, size_t t) {
+    handle_set_int_body(req, d, l, i, t, 0, 100, WEB_CMD_CALIB_SET_PID_PIV_MAX_CORR);
+}
 
 // =============================================================
 //  web_ui_init
@@ -560,8 +981,10 @@ void web_ui_init() {
     s_server.on("/state",  HTTP_GET,  handle_state);
     s_server.on("/maze",   HTTP_GET,  handle_maze);
     s_server.on("/stop",   HTTP_POST, handle_stop);
+    s_server.on("/reset",  HTTP_POST, handle_reset);
     s_server.on("/start1", HTTP_POST, handle_start1);
     s_server.on("/start2", HTTP_POST, handle_start2);
+    s_server.on("/start_wall_r", HTTP_POST, handle_start_wall_r);
 
     // Routes calibration
     s_server.on("/calib",            HTTP_GET,  handle_calib_get);
@@ -571,6 +994,33 @@ void web_ui_init() {
     s_server.on("/calib/opening_r",  HTTP_POST, handle_calib_opening_r);
     s_server.on("/calib/reset",      HTTP_POST, handle_calib_reset);
     s_server.on("/calib/post",       HTTP_POST, handle_calib_post);
+    s_server.on("/calib/wall_l",     HTTP_POST, handle_calib_wall_l);
+    s_server.on("/calib/wall_r",     HTTP_POST, handle_calib_wall_r);
+    s_server.on("/calib/set_pivot_90", HTTP_POST,
+        [](AsyncWebServerRequest* req){}, nullptr, handle_calib_set_pivot_90_body);
+    s_server.on("/calib/set_cell",     HTTP_POST,
+        [](AsyncWebServerRequest* req){}, nullptr, handle_calib_set_cell_body);
+    s_server.on("/calib/set_piv45_r",  HTTP_POST,
+        [](AsyncWebServerRequest* req){}, nullptr, handle_set_piv45_r_body);
+    s_server.on("/calib/set_piv45_l",  HTTP_POST,
+        [](AsyncWebServerRequest* req){}, nullptr, handle_set_piv45_l_body);
+    s_server.on("/calib/set_smooth_move",   HTTP_POST,
+        [](AsyncWebServerRequest* req){}, nullptr, handle_set_smooth_move_body);
+    s_server.on("/calib/set_smooth_center", HTTP_POST,
+        [](AsyncWebServerRequest* req){}, nullptr, handle_set_smooth_center_body);
+
+    // PID Tuning routes
+    s_server.on("/calib/set_pid_kp", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_kp_body);
+    s_server.on("/calib/set_pid_ki", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_ki_body);
+    s_server.on("/calib/set_pid_kd", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_kd_body);
+    s_server.on("/calib/set_pid_tof_kp", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_tof_kp_body);
+    s_server.on("/calib/set_pid_tof_ki", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_tof_ki_body);
+    s_server.on("/calib/set_pid_tof_kd", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_tof_kd_body);
+    s_server.on("/calib/set_pid_tof_max_corr", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_tof_max_corr_body);
+    s_server.on("/calib/set_pid_piv_kp", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_piv_kp_body);
+    s_server.on("/calib/set_pid_piv_ki", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_piv_ki_body);
+    s_server.on("/calib/set_pid_piv_kd", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_piv_kd_body);
+    s_server.on("/calib/set_pid_piv_max_corr", HTTP_POST, [](AsyncWebServerRequest* req){}, nullptr, handle_set_pid_piv_max_corr_body);
 
     // Routes avec body JSON
     s_server.on("/move", HTTP_POST,
@@ -601,7 +1051,12 @@ WebCmd web_ui_poll_cmd() {
     return c;
 }
 
+int web_ui_last_value() {
+    return (int)s_pending_value;
+}
+
 uint8_t web_ui_get_target_row() { return s_target_row; }
 uint8_t web_ui_get_target_col() { return s_target_col; }
 uint8_t web_ui_get_start_row()  { return s_start_row; }
 uint8_t web_ui_get_start_col()  { return s_start_col; }
+uint8_t web_ui_get_start_dir()  { return s_start_dir; }

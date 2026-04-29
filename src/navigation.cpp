@@ -16,17 +16,26 @@
 enum NavAction {
     ACT_NONE,
     ACT_ADVANCE,
-    ACT_TURN_SETTLING,   // stabilisation avant de commencer un pivot
-    ACT_TURN1,           // premier pivot 45° (ou 180° complet)
-    ACT_TURN_CROSS,      // avance courte entre les deux demi-pivots (recalage poteau)
-    ACT_TURN2,           // second pivot 45°
-    ACT_AUTO_ALIGN
+    ACT_REVERSE_ALIGN,   // pré-alignement frontal AVANT le reverse (cul-de-sac)
+    ACT_REVERSE,         // marche arrière d'une case
+    ACT_TURN_PRE_ALIGN,  // auto-align frontal AVANT le pivot (si mur devant)
+    ACT_TURN_SETTLING,   // stabilisation avant de commencer la rotation
+    ACT_TURN_PIVOT,      // pivot sur place (90° ou 180°), arrêt sur ticks (IMU = garde)
+    ACT_AUTO_ALIGN,
+    ACT_SMOOTH_45_1,     // Étape 1 : premier pivot 45°
+    ACT_SMOOTH_SETTLE_1, // Étape 2 : pause
+    ACT_SMOOTH_MOVE,     // Étape 3 : avance 40mm
+    ACT_SMOOTH_SETTLE_2, // Étape 4 : pause
+    ACT_SMOOTH_45_2,     // Étape 5 : second pivot 45°
+    ACT_SMOOTH_ALIGN,    // Étape 6 : recalage final (legacy)
+    ACT_SMOOTH_CENTER    // Étape 7 : centrage à 77mm du mur frontal
 };
 
 // ── Variables d'état internes ─────────────────────────────────
 static NavState    s_state          = NAV_IDLE;
 static NavAction   s_action         = ACT_NONE;
 static int         s_turn_quarters  = 0;      // +1=droite, -1=gauche, +2=180°
+static int         s_smooth_dir     = 0;      // +1=droite, -1=gauche (virage 45-40-45)
 static uint32_t    s_settle_start   = 0;      // timestamp début stabilisation
 
 // ── Cache capteurs (mis à jour toutes les PID_SAMPLE_MS ms) ──
@@ -45,6 +54,17 @@ static bool          s_wall_snap_valid = false;
 // ── Timer pour l'affichage Serial live ───────────────────────
 // Affiche l'état du mouvement en cours toutes les PID_SAMPLE_MS ms
 static uint32_t    s_last_log_ms    = 0;
+
+// ── Prototypes des fonctions internes ────────────────────────
+static NavState update_advance();
+static NavState update_reverse_align();
+static NavState update_reverse();
+static NavState update_turn();
+static NavState update_auto_align();
+static NavState update_smooth_turn();
+static void     start_pivot();
+static void     apply_pivot_pwm(long avg_ticks, long target_ticks);
+static int      pivot_base_pwm(long avg_ticks, long target_ticks);
 
 // ── nav_init ──────────────────────────────────────────────────
 void nav_init() {
@@ -121,8 +141,9 @@ static NavState update_advance() {
     }
 
     // ── Condition d'arrêt : distance atteinte ─────────────────
-    long avg_ticks = (labs(tL) + labs(tR)) / 2;
-    if (avg_ticks >= TICKS_PER_CELL) {
+    long cell_target = (long)calib_get_cell_ticks();
+    long avg_ticks   = (labs(tL) + labs(tR)) / 2;
+    if (avg_ticks >= cell_target) {
         motors_stop();
         s_state  = NAV_DONE;
         s_action = ACT_NONE;
@@ -132,7 +153,7 @@ static NavState update_advance() {
     // ── Snapshot murs au milieu de la case ───────────────────────
     // Pris à WALL_SNAP_PCT% des ticks pour avoir les murs de la case courante
     // (pas ceux de la suivante, que les capteurs à 45° voient en fin de case).
-    if (!s_wall_snap_valid && avg_ticks >= (long)(TICKS_PER_CELL * WALL_SNAP_PCT / 100)) {
+    if (!s_wall_snap_valid && avg_ticks >= (cell_target * WALL_SNAP_PCT / 100L)) {
         s_wall_snap = sensors_detect_walls(s_tof);
         s_wall_snap_valid = true;
         Serial.print("[NAV] Wall snap @ ticks="); Serial.print(avg_ticks);
@@ -141,45 +162,173 @@ static NavState update_advance() {
         Serial.print(" D="); Serial.println((int)s_wall_snap.right);
     }
 
-    // ── PID : ToF latéraux si les deux murs sont visibles, encodeurs sinon ──
-    // Priorité ToF : plus précis pour le centrage dans le couloir.
-    // Fallback encodeurs : couloir ouvert ou capteur invalide.
-    int pwm_l, pwm_r;
-    bool tof_valid = (s_tof.side_left  > 0 && s_tof.side_left  < TOF_MAX_MM &&
-                      s_tof.side_right > 0 && s_tof.side_right < TOF_MAX_MM);
+    // ── PID combiné (Encodeurs + ToF Latéral) ───────────────────
+    // 1. PID Encodeurs : maintient les roues synchronisées
+    int pwm_l_enc, pwm_r_enc;
+    pid_update(tL, tR, PWM_RUN1, pwm_l_enc, pwm_r_enc);
+    int corr_enc = pwm_r_enc - PWM_RUN1;
 
-    if (tof_valid) {
-        pid_update_tof((float)s_tof.side_left, (float)s_tof.side_right,
-                       calib_get_opening_l(), calib_get_opening_r(),
-                       PWM_RUN1, pwm_l, pwm_r);
-    } else {
-        pid_update(tL, tR, PWM_RUN1, pwm_l, pwm_r);
-    }
-    motors_set(pwm_l, pwm_r);
+    // 2. PID ToF : maintient le robot centré dans le couloir
+    int pwm_l_tof, pwm_r_tof;
+    pid_update_tof((float)s_tof.side_left, (float)s_tof.side_right,
+                   calib_get_opening_l(), calib_get_opening_r(),
+                   PWM_RUN1, pwm_l_tof, pwm_r_tof);
+    int corr_tof = pwm_r_tof - PWM_RUN1;
+
+    // 3. Somme des corrections
+    int final_l = constrain(PWM_RUN1 - corr_enc - corr_tof, 0, 255);
+    int final_r = constrain(PWM_RUN1 + corr_enc + corr_tof, 0, 255);
+    motors_set(final_l, final_r);
 
     // ── Affichage live @ PID_SAMPLE_MS ────────────────────────
     if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
         s_last_log_ms = now;
         Serial.print("[ADV] tL="); Serial.print(tL);
-        Serial.print("  tR=");    Serial.print(tR);
-        // Log capteurs frontaux (pour diagnostiquer arrêt TURN)
-        Serial.print("  FL="); Serial.print(s_tof.front_left);
-        Serial.print("  FR="); Serial.print(s_tof.front_right);
-        Serial.print("  TURN="); Serial.print(calib_get_turn());
-        if (tof_valid) {
-            Serial.print("  SL="); Serial.print(s_tof.side_left);
-            Serial.print("  SR="); Serial.print(s_tof.side_right);
-            Serial.print("  err="); Serial.print((int)s_tof.side_left - (int)s_tof.side_right);
-            Serial.print("mm  [PID:ToF]");
-        } else {
-            Serial.print("  ecart="); Serial.print(tL - tR);
-            Serial.print("  [PID:ENC]");
-        }
-        Serial.print("  pwm="); Serial.print(pwm_l);
-        Serial.print("/");      Serial.println(pwm_r);
+        Serial.print("  tR=");     Serial.print(tR);
+        Serial.print("  SL=");     Serial.print(s_tof.side_left);
+        Serial.print("  SR=");     Serial.print(s_tof.side_right);
+        Serial.print("  corr(E/T)="); Serial.print(corr_enc);
+        Serial.print("/");            Serial.print(corr_tof);
+        Serial.print("  pwm=");    Serial.print(final_l);
+        Serial.print("/");         Serial.println(final_r);
     }
 
     return NAV_BUSY;
+}
+
+// =============================================================
+//  NAV_START_REVERSE — demi-tour par marche arrière
+//  Phase 1 : alignement frontal sur le mur du cul-de-sac (FL≈FR)
+//  Phase 2 : marche arrière 1 case avec PID latéral (centrage couloir)
+//
+//  Les capteurs 45° voient toujours les murs latéraux pendant le recul,
+//  donc le PID latéral reste valide.
+// =============================================================
+void nav_start_reverse() {
+    encoders_reset();
+    pid_init();
+    s_wall_snap_valid = false;
+    s_last_tof_ms = 0;          // force lecture ToF immédiate
+    s_last_log_ms = millis();
+    motors_stop();              // frein avant pré-align
+    s_action = ACT_REVERSE_ALIGN;
+    s_state  = NAV_BUSY;
+    Serial.println("[REV] Démarrage — phase 1 : alignement frontal");
+}
+
+// ── Phase 1 : pré-alignement frontal (FL≈FR) ─────────────────
+// Pivot sur place doux pour égaliser les distances frontales.
+// Ne fait rien si pas de mur devant (alignement pas critique).
+static NavState update_reverse_align() {
+    uint32_t now = millis();
+    if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
+        sensors_read(s_tof);
+        s_last_tof_ms = now;
+    }
+    float fl = (float)s_tof.front_left;
+    float fr = (float)s_tof.front_right;
+
+    // Pas de mur frontal → on saute l'alignement
+    bool has_wall = (fl > 0 && fl < TOF_WALL_FRONT_MM &&
+                     fr > 0 && fr < TOF_WALL_FRONT_MM);
+    if (!has_wall) {
+        Serial.println("[REV] Pas de mur frontal -> reverse direct");
+        encoders_reset();
+        pid_init();
+        s_action = ACT_REVERSE;
+        s_last_log_ms = now;
+        return NAV_BUSY;
+    }
+
+    float angle_err = fl - fr;
+    if (fabsf(angle_err) > ALIGN_ANGLE_TOL_MM) {
+        int sign = (angle_err > 0) ? 1 : -1;
+        motors_set(-sign * PWM_ALIGN_TURN, sign * PWM_ALIGN_TURN);
+        return NAV_BUSY;
+    }
+
+    // Aligné → passage à la marche arrière
+    motors_stop();
+    encoders_reset();
+    pid_init();
+    s_action = ACT_REVERSE;
+    s_last_log_ms = now;
+    Serial.print("[REV] Alignement OK (FL="); Serial.print(fl, 0);
+    Serial.print(" FR=");                    Serial.print(fr, 0);
+    Serial.println(") -> marche arrière");
+    return NAV_BUSY;
+}
+
+// ── Phase 2 : marche arrière avec PID encodeurs + PID latéral ──
+static NavState update_reverse() {
+    uint32_t now = millis();
+
+    if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
+        sensors_read(s_tof);
+        s_last_tof_ms = now;
+    }
+
+    long tL = encoders_get_left();
+    long tR = encoders_get_right();
+    long avg_ticks = (labs(tL) + labs(tR)) / 2;
+    long cell_target = (long)calib_get_cell_ticks();
+
+    if (avg_ticks >= cell_target) {
+        motors_stop();
+        s_state  = NAV_DONE;
+        s_action = ACT_NONE;
+        Serial.println("[REV] Marche arrière terminée");
+        return NAV_DONE;
+    }
+
+    // 1. PID encodeurs (synchronisation roues)
+    int pwm_l_enc, pwm_r_enc;
+    pid_update(tL, tR, PWM_RUN1, pwm_l_enc, pwm_r_enc);
+    int corr_enc = pwm_r_enc - PWM_RUN1;
+
+    // 2. PID latéral (centrage couloir) — capteurs 45° voient toujours.
+    //    EN MARCHE ARRIÈRE le sens de correction est INVERSÉ : si on est
+    //    trop à gauche (SL petit), accélérer le moteur GAUCHE en arrière
+    //    (et non droit) pour s'écarter du mur gauche.
+    int pwm_l_tof, pwm_r_tof;
+    pid_update_tof((float)s_tof.side_left, (float)s_tof.side_right,
+                   calib_get_opening_l(), calib_get_opening_r(),
+                   PWM_RUN1, pwm_l_tof, pwm_r_tof);
+    int corr_tof = pwm_r_tof - PWM_RUN1;
+
+    // Application : signes négatifs pour reculer, corrections inversées
+    int final_l = constrain(-PWM_RUN1 + corr_enc + corr_tof, -255, 0);
+    int final_r = constrain(-PWM_RUN1 - corr_enc - corr_tof, -255, 0);
+    motors_set(final_l, final_r);
+
+    if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
+        s_last_log_ms = now;
+        Serial.print("[REV] tL="); Serial.print(tL);
+        Serial.print(" tR=");      Serial.print(tR);
+        Serial.print(" SL=");      Serial.print(s_tof.side_left);
+        Serial.print(" SR=");      Serial.print(s_tof.side_right);
+        Serial.print(" corr(E/T)="); Serial.print(corr_enc);
+        Serial.print("/");           Serial.print(corr_tof);
+        Serial.print(" pwm=");     Serial.print(final_l);
+        Serial.print("/");         Serial.println(final_r);
+    }
+    return NAV_BUSY;
+}
+
+// =============================================================
+//  NAV_START_SMOOTH_TURN
+//  Démarre la séquence 45° -> 40mm -> 45°
+// =============================================================
+void nav_start_smooth_turn(int direction) {
+    motors_stop();
+    encoders_reset();
+    pid_init();
+    s_smooth_dir = (direction > 0) ? 1 : -1;
+    s_action     = ACT_SMOOTH_45_1;
+    s_state      = NAV_BUSY;
+    s_settle_start = millis();
+    Serial.print("[SMOOTH] Début virage ");
+    Serial.println(s_smooth_dir > 0 ? "DROITE" : "GAUCHE");
 }
 
 // =============================================================
@@ -192,170 +341,358 @@ void nav_start_turn(int quarters) {
     motors_stop();              // frein immédiat avant de tourner
     encoders_reset();           // reset encodeurs — on va s'en servir pour la décélération
     s_turn_quarters = quarters;
-    s_settle_start  = millis();
-    s_action = ACT_TURN_SETTLING;
+    s_last_tof_ms   = 0;        // force lecture ToF immédiate dans pre-align
+    s_action = ACT_TURN_PRE_ALIGN;
     s_state  = NAV_BUSY;
+    Serial.println("[TURN] Pré-alignement frontal");
 }
 
-// ── Aide interne : démarre un pivot dans la bonne direction ──
+// ── Calcule le PWM de base pivot via rampe linéaire de décélération ──
+// De 0 à PIVOT_DECEL_PCT% des ticks → PWM_PIVOT_FAST.
+// De PIVOT_DECEL_PCT% à 100% → interpolation linéaire vers PWM_PIVOT_SLOW.
+// Au-delà de 100% → PWM_PIVOT_SLOW (au cas où l'IMU n'a pas encore stoppé).
+static int pivot_base_pwm(long avg_ticks, long target_ticks) {
+    long decel_start = (target_ticks * PIVOT_DECEL_PCT) / 100L;
+    if (avg_ticks <= decel_start)  return PWM_PIVOT_FAST;
+    if (avg_ticks >= target_ticks) return PWM_PIVOT_SLOW;
+    // interpolation linéaire entre decel_start et target_ticks
+    long span = target_ticks - decel_start;
+    long pos  = avg_ticks - decel_start;
+    int  diff = PWM_PIVOT_FAST - PWM_PIVOT_SLOW;
+    return PWM_PIVOT_FAST - (int)((diff * pos) / span);
+}
+
+// ── Démarre le pivot dans la bonne direction ─────────────────
+// Roues en sens opposés. PWM symétrique au-dessus du seuil de stall ;
+// le PID pivot prend le relais à chaque cycle.
 static void start_pivot() {
-    imu_reset_heading();
     encoders_reset();
-    if (s_turn_quarters > 0) motors_turn_right(PWM_TURN);
-    else                      motors_turn_left(PWM_TURN);
+    pid_init();
+    int dir  = (s_turn_quarters > 0) ? 1 : -1;
+    int kick = PWM_PIVOT_FAST;
+    if (dir > 0) motors_set( kick, -kick);   // horaire (droite)
+    else         motors_set(-kick,  kick);   // antihoraire (gauche)
 }
 
-// ── Applique les PWM de pivot avec décélération en fin de course ──
-// avg_ticks : ticks déjà parcourus, target : ticks cible du pivot.
-// Sur les derniers (100-TURN_DECEL_PCT)% : rampe linéaire PWM_TURN→DECEL.
-static void apply_pivot_pwm(long avg_ticks, long target) {
-    long decel_start = target * TURN_DECEL_PCT / 100L;
-    int out_pwm, in_pwm;
-    if (avg_ticks >= decel_start && decel_start < target) {
-        // t ∈ [0,1] : 0 = début décél, 1 = fin pivot
-        float t = (float)(avg_ticks - decel_start) / (float)(target - decel_start);
-        t = constrain(t, 0.0f, 1.0f);
-        out_pwm = (int)(PWM_TURN       + t * (PWM_TURN_DECEL_OUTER - PWM_TURN));
-        in_pwm  = (int)(PWM_TURN_INNER + t * (PWM_TURN_DECEL_INNER - PWM_TURN_INNER));
-        // Garantie minimum pour vaincre le frottement
-        out_pwm = max(out_pwm, PWM_TURN_DECEL_OUTER);
-        in_pwm  = max(in_pwm,  PWM_TURN_DECEL_INNER);
-    } else {
-        out_pwm = PWM_TURN;
-        in_pwm  = PWM_TURN_INNER;
+// ── Applique le PID pivot avec base = rampe linéaire ─────────
+// Force |ticks_L| ≈ |ticks_R| → pivot autour du centre du robot.
+static void apply_pivot_pwm(long avg_ticks, long target_ticks) {
+    int  base = pivot_base_pwm(avg_ticks, target_ticks);
+    // Direction : s_turn_quarters (90/180) ou s_smooth_dir (45)
+    int  dir  = (s_action == ACT_TURN_PIVOT) ? ((s_turn_quarters > 0) ? 1 : -1) : s_smooth_dir;
+    long tL   = encoders_get_left();
+    long tR   = encoders_get_right();
+    int pwm_l, pwm_r;
+    pid_update_pivot(tL, tR, dir, base, pwm_l, pwm_r);
+    motors_set(pwm_l, pwm_r);
+}
+
+// ── Mise à jour du virage complexe 45-40-45 ───────────────────
+static NavState update_smooth_turn() {
+    uint32_t now = millis();
+    long tL = encoders_get_left();
+    long tR = encoders_get_right();
+    long avg_ticks = (labs(tL) + labs(tR)) / 2;
+    
+    // On choisit la cible de ticks selon la direction (calibrable via web UI)
+    long target_45 = (s_smooth_dir > 0) ? (long)calib_get_pivot_45_r()
+                                         : (long)calib_get_pivot_45_l();
+    long target_move = (long)calib_get_smooth_move();
+
+    switch (s_action) {
+        case ACT_SMOOTH_45_1:
+            apply_pivot_pwm(avg_ticks, target_45);
+            if (avg_ticks >= target_45) {
+                motors_stop();
+                s_settle_start = now;
+                s_action = ACT_SMOOTH_SETTLE_1;
+                Serial.println("[SMOOTH] 45° (1) OK -> Pause");
+            }
+            break;
+
+        case ACT_SMOOTH_SETTLE_1:
+            if (now - s_settle_start >= (uint32_t)TURN_SETTLE_MS) {
+                encoders_reset();
+                pid_init();
+                s_action = ACT_SMOOTH_MOVE;
+                Serial.println("[SMOOTH] Avance 40mm...");
+            }
+            break;
+
+        case ACT_SMOOTH_MOVE:
+            {
+                // PID combiné pour l'avance de 40mm
+                if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
+                    sensors_read(s_tof);
+                    s_last_tof_ms = now;
+                }
+                int pwm_l_enc, pwm_r_enc;
+                pid_update(tL, tR, PWM_RUN1, pwm_l_enc, pwm_r_enc);
+                int corr_enc = pwm_r_enc - PWM_RUN1;
+
+                int pwm_l_tof, pwm_r_tof;
+                pid_update_tof((float)s_tof.side_left, (float)s_tof.side_right,
+                               calib_get_opening_l(), calib_get_opening_r(),
+                               PWM_RUN1, pwm_l_tof, pwm_r_tof);
+                int corr_tof = pwm_r_tof - PWM_RUN1;
+
+                motors_set(constrain(PWM_RUN1 - corr_enc - corr_tof, 0, 255),
+                           constrain(PWM_RUN1 + corr_enc + corr_tof, 0, 255));
+
+                if (avg_ticks >= target_move) {
+                    motors_stop();
+                    s_settle_start = now;
+                    s_action = ACT_SMOOTH_SETTLE_2;
+                    Serial.println("[SMOOTH] 40mm OK -> Pause");
+                }
+            }
+            break;
+
+        case ACT_SMOOTH_SETTLE_2:
+            if (now - s_settle_start >= (uint32_t)TURN_SETTLE_MS) {
+                encoders_reset();
+                pid_init();
+                s_action = ACT_SMOOTH_45_2;
+                Serial.println("[SMOOTH] 45° (2)...");
+            }
+            break;
+
+        case ACT_SMOOTH_45_2:
+            apply_pivot_pwm(avg_ticks, target_45);
+            if (avg_ticks >= target_45) {
+                motors_stop();
+                s_action = ACT_SMOOTH_CENTER;
+                s_last_tof_ms = 0;       // force lecture ToF immédiate
+                s_settle_start = now;    // réutilisé comme timeout
+                Serial.println("[SMOOTH] 45° (2) OK -> Centrage 77mm...");
+            }
+            break;
+
+        case ACT_SMOOTH_CENTER:
+            {
+                if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
+                    sensors_read(s_tof);
+                    s_last_tof_ms = now;
+                }
+                float fl = (float)s_tof.front_left;
+                float fr = (float)s_tof.front_right;
+
+                // On ne tente le centrage QUE si un mur est PROCHE (< 250mm).
+                // Sinon le robot fonce en avant pour atteindre 77mm sans
+                // rien y voir → comportement erratique. Mieux vaut s'arrêter.
+                const float CENTER_GUARD_MM = 250.0f;
+                bool fl_ok = (fl > 0 && fl < CENTER_GUARD_MM);
+                bool fr_ok = (fr > 0 && fr < CENTER_GUARD_MM);
+                if (!fl_ok && !fr_ok) {
+                    motors_stop();
+                    Serial.println("[SMOOTH] Centrage : pas de mur proche -> FIN (skip)");
+                    s_state  = NAV_DONE;
+                    s_action = ACT_NONE;
+                    return NAV_DONE;
+                }
+
+                // Distance frontale = moyenne des 2 capteurs valides, ou le seul valide
+                float front;
+                if (fl_ok && fr_ok)  front = (fl + fr) * 0.5f;
+                else if (fl_ok)      front = fl;
+                else                 front = fr;
+
+                float dist_err = front - (float)calib_get_smooth_center();
+
+                // Arrivé dans la tolérance → fini
+                if (fabsf(dist_err) <= (float)SMOOTH_CENTER_TOL_MM) {
+                    motors_stop();
+                    Serial.print("[SMOOTH] Centrage OK -> FIN, front=");
+                    Serial.print(front, 0); Serial.println("mm");
+                    s_state  = NAV_DONE;
+                    s_action = ACT_NONE;
+                    return NAV_DONE;
+                }
+
+                // Timeout 1.5s pour éviter de rester coincé
+                if (now - s_settle_start > 1500) {
+                    motors_stop();
+                    Serial.print("[SMOOTH] Centrage TIMEOUT -> FIN, front=");
+                    Serial.print(front, 0); Serial.println("mm");
+                    s_state  = NAV_DONE;
+                    s_action = ACT_NONE;
+                    return NAV_DONE;
+                }
+
+                // P proportionnel + clamp + signe (avant si trop loin, recule si trop près)
+                int sign = (dist_err > 0) ? 1 : -1;
+                int pwm  = (int)fabsf(dist_err * 2.0f);
+                pwm = constrain(pwm, SMOOTH_CENTER_PWM_MIN, SMOOTH_CENTER_PWM_MAX);
+                motors_set(sign * pwm, sign * pwm);
+            }
+            break;
+
+        case ACT_SMOOTH_ALIGN:
+            {
+                // On avance doucement pour se centrer dans la case suivante
+                if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
+                    sensors_read(s_tof);
+                    s_last_tof_ms = now;
+                }
+                float fl = (float)s_tof.front_left;
+                float fr = (float)s_tof.front_right;
+
+                // 1. Correction d'angle (toujours prioritaire)
+                float angle_err = fl - fr;
+                if (fl > 0 && fr > 0 && fabsf(angle_err) > (float)TOF_ALIGN_TOL_MM) {
+                    // Facteur réduit à 3.0 (au lieu de 5.0)
+                    int turn_pwm = (int)(angle_err * 3.0f);
+                    // Minimum baissé à 60
+                    int sign = (turn_pwm > 0) ? 1 : -1;
+                    turn_pwm = sign * constrain(abs(turn_pwm), 60, 80);
+                    motors_set(-turn_pwm, turn_pwm);
+                    return NAV_BUSY;
+                }
+
+                // 2. Avance vers la distance cible de la case (TOF_ALIGN_TARGET_MM)
+                if (fl > 0 && fr > 0) {
+                    float avg_dist = (fl + fr) / 2.0f;
+                    float dist_err = avg_dist - (float)TOF_ALIGN_TARGET_MM;
+                    
+                    if (fabsf(dist_err) > (float)ALIGN_DIST_TOL_MM) {
+                        // Translation proportionnelle plus douce
+                        int move_base = (int)(dist_err * 3.0f);
+                        int sign = (move_base > 0) ? 1 : -1;
+                        move_base = sign * constrain(abs(move_base), 65, 85);
+
+                        int pwm_l, pwm_r;
+                        pid_update_tof((float)s_tof.side_left, (float)s_tof.side_right,
+                                       calib_get_opening_l(), calib_get_opening_r(),
+                                       move_base, pwm_l, pwm_r);
+                        motors_set(pwm_l, pwm_r);
+                        return NAV_BUSY;
+                    }
+                }
+
+ else {
+                    // Pas de mur devant ? On avance juste de 20mm pour "entrer" dans la case
+                    // (Optionnel : si tu veux une avance aveugle sans mur frontal)
+                    motors_stop();
+                    s_state = NAV_DONE;
+                    s_action = ACT_NONE;
+                    return NAV_DONE;
+                }
+
+                // Centrage terminé
+                motors_stop();
+                Serial.println("[SMOOTH] Recalage et centrage OK -> FIN");
+                s_state = NAV_DONE;
+                s_action = ACT_NONE;
+                return NAV_DONE;
+            }
+            break;
+
+        default: break;
     }
-    if (s_turn_quarters > 0) motors_set(out_pwm, -in_pwm);   // droite
-    else                      motors_set(-in_pwm,  out_pwm);  // gauche
+    return NAV_BUSY;
 }
 
 // ── Mise à jour de la rotation ────────────────────────────────
-// Cinématique décomposée (90°) : pivot 45° → avance courte → pivot 45°
-// 180° : pivot continu jusqu'à TICKS_PER_180DEG.
-// Détection de poteau pendant la phase cross (côté intérieur du virage).
+// 90° et 180° : pivot sur place. Arrêt PRINCIPAL sur ticks (calib).
+// L'IMU est un garde-fou : si l'angle dépasse la cible avant les ticks
+// (glissement excessif), on stoppe quand même avec un log d'alerte.
 static NavState update_turn() {
     uint32_t now = millis();
+
+    // ── Phase pré-alignement frontal ──────────────────────────
+    if (s_action == ACT_TURN_PRE_ALIGN) {
+        if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
+            sensors_read(s_tof);
+            s_last_tof_ms = now;
+        }
+        float fl = (float)s_tof.front_left;
+        float fr = (float)s_tof.front_right;
+
+        bool has_wall = (fl > 0 && fl <= TOF_WALL_FRONT_MM &&
+                         fr > 0 && fr <= TOF_WALL_FRONT_MM);
+        if (!has_wall) {
+            motors_stop();
+            s_settle_start = now;
+            s_action = ACT_TURN_SETTLING;
+            Serial.println("[TURN] Pas de mur frontal — settling direct");
+            return NAV_BUSY;
+        }
+
+        // Étape 1 : correction angulaire (FL ≈ FR) — bang-bang
+        float angle_err = fl - fr;
+        if (fabsf(angle_err) > ALIGN_ANGLE_TOL_MM) {
+            int sign = (angle_err > 0) ? 1 : -1;
+            motors_set(-sign * PWM_ALIGN_TURN, sign * PWM_ALIGN_TURN);
+            return NAV_BUSY;
+        }
+
+        // Étape 2 : distance cible TOF_ALIGN_TARGET_MM — bang-bang
+        float avg_dist = (fl + fr) / 2.0f;
+        float dist_err = avg_dist - (float)TOF_ALIGN_TARGET_MM;
+        if (fabsf(dist_err) > ALIGN_DIST_TOL_MM) {
+            int sign = (dist_err > 0) ? 1 : -1;
+            motors_set(sign * PWM_ALIGN_MOVE, sign * PWM_ALIGN_MOVE);
+            return NAV_BUSY;
+        }
+
+        // Aligné → settling
+        motors_stop();
+        encoders_reset();
+        s_settle_start = now;
+        s_action = ACT_TURN_SETTLING;
+        Serial.print("[TURN] Pré-align OK — dist=");
+        Serial.print(avg_dist, 0); Serial.println("mm");
+        return NAV_BUSY;
+    }
+
+    bool is_180 = (abs(s_turn_quarters) == 2);
 
     // ── Phase de stabilisation ─────────────────────────────────
     if (s_action == ACT_TURN_SETTLING) {
         if (now - s_settle_start >= TURN_SETTLE_MS) {
             s_last_log_ms = now;
             start_pivot();
-            s_action = ACT_TURN1;
-            Serial.println("[TURN] Phase 1 — pivot 45°");
+            s_action = ACT_TURN_PIVOT;
+            Serial.print("[TURN] Pivot ");
+            Serial.print(is_180 ? "180" : "90");
+            Serial.print("° démarré — cible ticks=");
+            Serial.println(is_180 ? TICKS_PIVOT_180 : calib_get_pivot_90_ticks());
         }
         return NAV_BUSY;
     }
 
-    long tL       = encoders_get_left();
-    long tR       = encoders_get_right();
+    long tL        = encoders_get_left();
+    long tR        = encoders_get_right();
     long avg_ticks = (labs(tL) + labs(tR)) / 2;
-    bool is_180   = (abs(s_turn_quarters) == 2);
 
-    // ── Phase 1 : premier 45° (ou 180° complet) ───────────────
-    if (s_action == ACT_TURN1) {
-        long target = is_180 ? (long)TICKS_PER_180DEG : (long)TICKS_PER_45DEG;
+    // ── Phase PIVOT : 90° (calib) ou 180° (TICKS_PIVOT_180) ──
+    // Arrêt UNIQUEMENT sur ticks encodeurs (IMU non utilisée).
+    if (s_action == ACT_TURN_PIVOT) {
+        long tick_target = is_180 ? (long)TICKS_PIVOT_180 : (long)calib_get_pivot_90_ticks();
 
-        if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
-            s_last_log_ms = now;
-            Serial.print("[TURN1] ticks="); Serial.print(avg_ticks);
-            Serial.print("/");             Serial.println(target);
-        }
-
-        // Décélération progressive sur les derniers TURN_DECEL_PCT%
-        apply_pivot_pwm(avg_ticks, target);
-
-        if (avg_ticks >= target) {
-            motors_stop();
-            if (is_180) {
-                Serial.println("[TURN] 180° terminé");
-                s_state  = NAV_DONE;
-                s_action = ACT_NONE;
-                return NAV_DONE;
-            }
-            // → avance courte (phase cross)
-            encoders_reset();
-            s_last_tof_ms = 0;
-            motors_set(TURN_CROSS_PWM, TURN_CROSS_PWM);
-            s_action = ACT_TURN_CROSS;
-            s_last_log_ms = now;
-            Serial.println("[TURN] Phase cross — avance courte");
-        }
-        return NAV_BUSY;
-    }
-
-    // ── Phase cross : avance courte + détection poteau ────────
-    if (s_action == ACT_TURN_CROSS) {
-        // Lecture capteurs (non bloquante)
-        if (now - s_last_tof_ms >= (uint32_t)PID_SAMPLE_MS) {
-            sensors_read(s_tof);
-            s_last_tof_ms = now;
-        }
+        apply_pivot_pwm(avg_ticks, tick_target);
 
         if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
             s_last_log_ms = now;
-            Serial.print("[CROSS] ticks="); Serial.print(avg_ticks);
-            Serial.print(" SL="); Serial.print(s_tof.side_left);
-            Serial.print(" SR="); Serial.println(s_tof.side_right);
+            Serial.print("[PIV] ticks="); Serial.print(avg_ticks);
+            Serial.print("/");            Serial.print(tick_target);
+            Serial.print(" pwm=");        Serial.print(pivot_base_pwm(avg_ticks, tick_target));
+            Serial.print(" tL=");         Serial.print(tL);
+            Serial.print(" tR=");         Serial.println(tR);
         }
 
-        // Poteau détecté côté intérieur du virage :
-        //   virage droite (+1) → intérieur = côté gauche → surveiller SL
-        //   virage gauche (-1) → intérieur = côté droit  → surveiller SR
-        int post_thresh = calib_get_post_detect();
-        bool post = false;
-        if (s_turn_quarters > 0)
-            post = (s_tof.side_left  > 0 && s_tof.side_left  < post_thresh);
-        else
-            post = (s_tof.side_right > 0 && s_tof.side_right < post_thresh);
-
-        if (avg_ticks >= TURN_CROSS_TICKS || post) {
+        if (avg_ticks >= tick_target) {
             motors_stop();
-            if (post) Serial.println("[TURN] Poteau détecté — position recalée");
-            // → second pivot 45°
-            delay(30);  // micro-pause pour absorber l'inertie
-            start_pivot();
-            s_action = ACT_TURN2;
-            s_last_log_ms = now;
-            Serial.println("[TURN] Phase 2 — pivot 45°");
-        }
-        return NAV_BUSY;
-    }
-
-    // ── Phase 2 : second 45° ──────────────────────────────────
-    if (s_action == ACT_TURN2) {
-        long target2 = (long)TICKS_PER_45DEG;
-
-        if (now - s_last_log_ms >= (uint32_t)PID_SAMPLE_MS) {
-            s_last_log_ms = now;
-            Serial.print("[TURN2] ticks="); Serial.print(avg_ticks);
-            Serial.print("/");             Serial.println(target2);
-        }
-
-        // Décélération progressive identique à TURN1
-        apply_pivot_pwm(avg_ticks, target2);
-
-        if (avg_ticks >= target2) {
-            motors_stop();
-            Serial.println("[TURN] 90° termine (45 + cross + 45)");
+            Serial.print("[TURN] Pivot ");
+            Serial.print(is_180 ? "180" : "90");
+            Serial.println("° terminé (ticks)");
             s_state  = NAV_DONE;
             s_action = ACT_NONE;
             return NAV_DONE;
         }
+        return NAV_BUSY;
     }
-
     return NAV_BUSY;
-}
-
-// =============================================================
-//  NAV_START_AUTO_ALIGN
-//  Si un mur est présent devant (FL et FR < TOF_WALL_FRONT_MM) :
-//   1. Corrige l'angle : micro-rotation jusqu'à FL ≈ FR
-//   2. Ajuste la distance : avance/recule jusqu'à (FL+FR)/2 ≈ TOF_ALIGN_TARGET_MM
-//  Sinon : NAV_DONE immédiatement (pas de mur = rien à faire)
-// =============================================================
-void nav_start_auto_align() {
-    s_action = ACT_AUTO_ALIGN;
-    s_state  = NAV_BUSY;
 }
 
 // ── Mise à jour de l'auto-alignement ─────────────────────────
@@ -368,7 +705,6 @@ static NavState update_auto_align() {
     float fl = (float)s_tof.front_left;
     float fr = (float)s_tof.front_right;
 
-    // Pas de mur devant → rien à faire
     if (fl == 0 || fl > TOF_WALL_FRONT_MM ||
         fr == 0 || fr > TOF_WALL_FRONT_MM) {
         motors_stop();
@@ -377,30 +713,22 @@ static NavState update_auto_align() {
         return NAV_DONE;
     }
 
-    // Étape 1 : correction angulaire (FL doit être ≈ FR)
     float angle_error = fl - fr;
     if (fabsf(angle_error) > TOF_ALIGN_TOL_MM) {
-        // Gain proportionnel simple : 1mm d'erreur → 2 unités PWM
-        int turn_pwm = (int)(angle_error * 2.0f);
-        turn_pwm = constrain(turn_pwm, -PWM_DIAG, PWM_DIAG);
-        // Si FL > FR : tourner légèrement vers la droite pour se rapprocher du mur gauche
-        motors_set(-turn_pwm, turn_pwm);
+        int sign = (angle_error > 0) ? 1 : -1;
+        motors_set(-sign * 70, sign * 70);
         return NAV_BUSY;
     }
 
-    // Étape 2 : correction de distance
     float avg_dist  = (fl + fr) / 2.0f;
     float dist_err  = avg_dist - (float)TOF_ALIGN_TARGET_MM;
 
     if (fabsf(dist_err) > 3.0f) {
-        // dist_err > 0 → trop loin → avancer ; dist_err < 0 → trop proche → reculer
-        int move_pwm = (int)(dist_err * 1.5f);
-        move_pwm = constrain(move_pwm, -PWM_DIAG, PWM_DIAG);
-        motors_set(move_pwm, move_pwm);
+        int sign = (dist_err > 0) ? 1 : -1;
+        motors_set(sign * 75, sign * 75);
         return NAV_BUSY;
     }
 
-    // Alignement terminé
     motors_stop();
     Serial.print("[NAV] Auto-align OK — dist=");
     Serial.print(avg_dist, 0);
@@ -419,14 +747,28 @@ NavState nav_update() {
         case ACT_ADVANCE:
             return update_advance();
 
+        case ACT_REVERSE_ALIGN:
+            return update_reverse_align();
+
+        case ACT_REVERSE:
+            return update_reverse();
+
+        case ACT_TURN_PRE_ALIGN:
         case ACT_TURN_SETTLING:
-        case ACT_TURN1:
-        case ACT_TURN_CROSS:
-        case ACT_TURN2:
+        case ACT_TURN_PIVOT:
             return update_turn();
 
         case ACT_AUTO_ALIGN:
             return update_auto_align();
+
+        case ACT_SMOOTH_45_1:
+        case ACT_SMOOTH_SETTLE_1:
+        case ACT_SMOOTH_MOVE:
+        case ACT_SMOOTH_SETTLE_2:
+        case ACT_SMOOTH_45_2:
+        case ACT_SMOOTH_ALIGN:
+        case ACT_SMOOTH_CENTER:
+            return update_smooth_turn();
 
         default:
             return NAV_IDLE;

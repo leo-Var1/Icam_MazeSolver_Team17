@@ -25,14 +25,18 @@
 enum TremauxPhase {
     TREM_SCAN,       // Lecture des capteurs + mise à jour carte
     TREM_DECIDE,     // Choix de la prochaine direction
-    TREM_ORIENT,     // Rotation vers la direction choisie
+    TREM_ORIENT,     // Rotation vers la direction choisie (smooth turn 90°)
+    TREM_REVERSE,    // Marche arrière d'une case (à la place du demi-tour)
     TREM_MOVE,       // Avance d'une case
+    TREM_PAUSE,      // Pause inter-case (TREM_PAUSE_MS ms)
     TREM_UPDATE,     // Mise à jour position dans la carte
     TREM_FINISHED    // Exploration terminée (toutes les cases visitées)
 };
 
-// Initialise l'algorithme — appeler avant le Run 1
-void tremaux_init();
+// Initialise l'algorithme depuis (start_row, start_col) facing start_dir
+// (0=N, 1=E, 2=S, 3=W). Remet les compteurs à zéro — appeler maze_init()
+// avant si on veut aussi réinitialiser la carte des murs.
+void tremaux_init(uint8_t start_row, uint8_t start_col, uint8_t start_dir = 0);
 
 // Exécute une étape de l'algorithme — appeler dans loop()
 // Retourne true quand l'exploration est terminée

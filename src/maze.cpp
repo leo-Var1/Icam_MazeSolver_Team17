@@ -88,6 +88,16 @@ void maze_advance_robot() {
     }
 }
 
+void maze_reverse_robot() {
+    // Recule dans la direction OPPOSÉE au facing — facing inchangé.
+    int8_t nr = s_robot_row - DIR_DR[s_robot_dir];
+    int8_t nc = s_robot_col - DIR_DC[s_robot_dir];
+    if (nr >= 0 && nr < MAZE_SIZE && nc >= 0 && nc < MAZE_SIZE) {
+        s_robot_row = nr;
+        s_robot_col = nc;
+    }
+}
+
 // =============================================================
 //  Mise à jour des murs depuis les capteurs
 // =============================================================
@@ -127,13 +137,24 @@ uint8_t maze_get_visited(uint8_t row, uint8_t col) {
 }
 
 bool maze_is_fully_explored() {
-    // Considère l'exploration terminée quand toutes les cases connues
-    // ont been visitées au moins une fois.
-    // Une case non connue = impossible à atteindre = ignorée.
+    // Critère correct :
+    //   1) Toute case connue doit être visitée au moins une fois.
+    //   2) Aucune case connue ne doit avoir un passage (mur absent) menant
+    //      vers une case non-connue → sinon il reste de l'inconnu accessible.
+    // Une case non-connue isolée (entourée de murs ou non atteignable) est
+    // ignorée — on ne peut pas y aller.
     for (uint8_t r = 0; r < MAZE_SIZE; r++) {
         for (uint8_t c = 0; c < MAZE_SIZE; c++) {
-            if (maze[r][c].known && maze[r][c].visited == 0) {
-                return false;
+            if (!maze[r][c].known) continue;
+            if (maze[r][c].visited == 0) return false;
+
+            // Vérifie chaque direction : passage libre vers case inconnue ?
+            for (uint8_t d = 0; d < 4; d++) {
+                if (maze[r][c].walls & DIR_WALL[d]) continue;        // mur → pas de passage
+                int8_t nr = (int8_t)r + DIR_DR[d];
+                int8_t nc = (int8_t)c + DIR_DC[d];
+                if (nr < 0 || nr >= MAZE_SIZE || nc < 0 || nc >= MAZE_SIZE) continue;
+                if (!maze[nr][nc].known) return false;               // frontière non explorée
             }
         }
     }

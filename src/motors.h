@@ -37,10 +37,3 @@ void motors_stop();
 // ── Roue libre ───────────────────────────────────────────────
 // Déconnecte les bobines → le robot glisse jusqu'à l'arrêt
 void motors_coast();
-
-// ── Rotation sur place ───────────────────────────────────────
-// Gauche arrière + Droite avant = tourne à gauche (antihoraire)
-// Gauche avant  + Droite arrière = tourne à droite (horaire)
-// pwm : valeur positive [0..255]
-void motors_turn_left(int pwm);
-void motors_turn_right(int pwm);

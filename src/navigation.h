@@ -43,10 +43,20 @@ void nav_init();
 // S'arrête aussi si un mur est détecté à < TOF_STOP_FRONT_MM
 void nav_start_advance();
 
+// Marche arrière d'une case (utile pour demi-tour sans pivot 180°).
+// PID encodeurs uniquement (pas de capteurs arrière). Le facing logique
+// du robot ne change pas — c'est l'appelant qui doit reculer la position
+// dans la grille (maze_reverse_robot()).
+void nav_start_reverse();
+
 // Rotation sur place
 // quarters : +1 = droite (horaire), -1 = gauche (antihoraire), +2 = demi-tour
 // Utilise l'IMU (gyro) pour détecter la fin de rotation
 void nav_start_turn(int quarters);
+
+// Virage propre 45° - 40mm - 45° (Stop-and-Go)
+// direction : +1 = droite, -1 = gauche
+void nav_start_smooth_turn(int direction);
 
 // Auto-alignement frontal
 // Si un mur est présent devant : avance/recule pour atteindre TOF_ALIGN_TARGET_MM

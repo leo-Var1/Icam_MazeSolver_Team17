@@ -13,27 +13,15 @@
 // ── État interne ──────────────────────────────────────────────
 static TremauxPhase s_phase     = TREM_SCAN;
 static uint8_t      s_chosen_dir = 0;  // Direction absolue choisie (0=N,1=E,2=S,3=W)
+static uint32_t     s_pause_start = 0;  // timestamp début pause inter-case
+static bool         s_did_reverse = false; // true si dernier mouvement = marche arrière
+static uint8_t      s_consecutive_rev = 0; // garde anti-boucle 180°
+#define TREM_MAX_CONSECUTIVE_REV  3
 
-// ── Helpers de détection de murs ─────────────────────────────
-// On lit les capteurs ToF et on seuille pour décider si un mur est présent.
-// Les seuils sont dans config.h (TOF_WALL_FRONT_MM, TOF_WALL_SIDE_MM).
-
-static bool wall_front(const ToFReadings& tof) {
-    // Mur frontal si les deux capteurs FL et FR détectent < TOF_WALL_FRONT_MM
-    // (valeur 0 = capteur non disponible → ignorer)
-    bool fl = (tof.front_left  > 0 && tof.front_left  < TOF_WALL_FRONT_MM);
-    bool fr = (tof.front_right > 0 && tof.front_right < TOF_WALL_FRONT_MM);
-    return fl || fr;  // au moins un détecte = considéré comme mur
-}
-
-static bool wall_left(const ToFReadings& tof) {
-    // Capteur latéral gauche à 45° — mur si distance < TOF_WALL_SIDE_MM
-    return (tof.side_left > 0 && tof.side_left < TOF_WALL_SIDE_MM);
-}
-
-static bool wall_right(const ToFReadings& tof) {
-    return (tof.side_right > 0 && tof.side_right < TOF_WALL_SIDE_MM);
-}
+// ── Détection murs ───────────────────────────────────────────
+// On délègue à sensors_detect_walls() qui applique les seuils calibrés
+// (calib_get_opening_l/r) + rejet géométrique (anti faux mur latéral
+// dû à un mur frontal proche). Cohérent avec le wall_snap.
 
 // ── Choix de la direction (cœur de Trémaux) ──────────────────
 // Règles (par priorité décroissante) :
@@ -103,14 +91,16 @@ static uint8_t tremaux_choose_direction() {
 }
 
 // ── tremaux_init ──────────────────────────────────────────────
-void tremaux_init() {
+void tremaux_init(uint8_t start_row, uint8_t start_col, uint8_t start_dir) {
     s_phase      = TREM_SCAN;
-    s_chosen_dir = 0;
-    // Position de départ : case (0,0), direction Nord
-    maze_set_pos(0, 0, 0);
-    // Marquer la case de départ comme visitée (on y est)
-    maze_mark_visited(0, 0);
-    Serial.println("[TREM] Initialisation — départ (0,0) direction Nord");
+    s_chosen_dir = start_dir;
+    s_consecutive_rev = 0;
+    maze_set_pos(start_row, start_col, start_dir);
+    maze_mark_visited(start_row, start_col);
+    Serial.print("[TREM] Initialisation — depart (");
+    Serial.print(start_row); Serial.print(",");
+    Serial.print(start_col); Serial.print(") facing=");
+    Serial.println("NESW"[start_dir]);
 }
 
 // ── tremaux_update ────────────────────────────────────────────
@@ -122,27 +112,33 @@ bool tremaux_update() {
         // Les capteurs à 45° voient la case SUIVANTE en fin de case → ne pas
         // lire les capteurs en direct ici (sauf au tout premier scan, sans avance).
         case TREM_SCAN: {
-            bool front, left, right;
-            WallDetection snap;
-            if (nav_get_wall_snap(snap)) {
-                // Snapshot disponible : murs lus au milieu de la case courante
-                front = snap.front;
-                left  = snap.left;
-                right = snap.right;
-            } else {
-                // Premier scan (départ) : aucune avance précédente → lire en direct
-                ToFReadings tof;
-                sensors_read(tof);
-                front = wall_front(tof);
-                left  = wall_left(tof);
-                right = wall_right(tof);
+            // Scan moyenné sur 3 lectures (~90ms) pour fiabilité.
+            // Robot stable après pause → meilleure mesure que le snap en mouvement.
+            ToFReadings sum = {0,0,0,0};
+            int n_fl=0, n_fr=0, n_sl=0, n_sr=0;
+            for (int i = 0; i < 3; i++) {
+                ToFReadings t;
+                sensors_read(t);
+                if (t.front_left  > 0) { sum.front_left  += t.front_left;  n_fl++; }
+                if (t.front_right > 0) { sum.front_right += t.front_right; n_fr++; }
+                if (t.side_left   > 0) { sum.side_left   += t.side_left;   n_sl++; }
+                if (t.side_right  > 0) { sum.side_right  += t.side_right;  n_sr++; }
+                delay(30);
             }
+            ToFReadings tof = {
+                (uint16_t)(n_fl ? sum.front_left  / n_fl : 0),
+                (uint16_t)(n_fr ? sum.front_right / n_fr : 0),
+                (uint16_t)(n_sl ? sum.side_left   / n_sl : 0),
+                (uint16_t)(n_sr ? sum.side_right  / n_sr : 0)
+            };
+            WallDetection wd = sensors_detect_walls(tof);
+            bool front = wd.front, left = wd.left, right = wd.right;
 
-            // Mettre à jour les murs de la case courante dans la carte
             maze_update_walls(front, left, right);
 
-            Serial.printf("[TREM] Scan (%d,%d) dir=%d : F=%d G=%d D=%d\n",
-                maze_get_row(), maze_get_col(), maze_get_dir(),
+            Serial.printf("[TREM] Scan (%d,%d) dir=%c | FL=%d FR=%d SL=%d SR=%d | F=%d G=%d D=%d\n",
+                maze_get_row(), maze_get_col(), "NESW"[maze_get_dir()],
+                tof.front_left, tof.front_right, tof.side_left, tof.side_right,
                 (int)front, (int)left, (int)right);
 
             s_phase = TREM_DECIDE;
@@ -153,46 +149,82 @@ bool tremaux_update() {
         case TREM_DECIDE: {
             s_chosen_dir = tremaux_choose_direction();
             uint8_t current_dir = maze_get_dir();
+            s_did_reverse = false;
 
             Serial.printf("[TREM] Décision : dir=%d (actuelle=%d)\n",
                 s_chosen_dir, current_dir);
 
             if (s_chosen_dir == current_dir) {
                 // Déjà orienté dans la bonne direction → avancer directement
+                s_consecutive_rev = 0;
                 s_phase = TREM_MOVE;
                 nav_start_advance();
             } else {
-                // Calculer le virage nécessaire en quarts de tour
+                // Calculer le virage en quarts de tour signés [-2..+2]
                 int diff = (int)s_chosen_dir - (int)current_dir;
-                // Normaliser dans [-2, 2] (le plus court chemin de rotation)
                 if (diff >  2) diff -= 4;
                 if (diff < -2) diff += 4;
-                // diff : +1=droite, -1=gauche, +2 ou -2=demi-tour → on prend +2
 
-                s_phase = TREM_ORIENT;
-                nav_start_turn(diff);
+                if (diff == 2 || diff == -2) {
+                    // Garde anti-boucle : si 3 reverse consécutifs → abort
+                    if (s_consecutive_rev >= TREM_MAX_CONSECUTIVE_REV) {
+                        Serial.printf("[TREM] !! BOUCLE 180° (%d reverse consecutifs) -> ABORT\n",
+                            s_consecutive_rev);
+                        Serial.println("[TREM] Detection murs probablement en cause. Touche 'w' pour test ToF.");
+                        s_phase = TREM_FINISHED;
+                        break;
+                    }
+                    Serial.printf("[TREM] Demi-tour → marche arrière #%d\n", s_consecutive_rev + 1);
+                    s_did_reverse = true;
+                    s_consecutive_rev++;
+                    s_phase = TREM_REVERSE;
+                    nav_start_reverse();
+                } else {
+                    s_consecutive_rev = 0;
+                    // ── 90° gauche/droite → smooth turn (45-avance-45) ──
+                    Serial.printf("[TREM] Virage 90° %s (smooth)\n",
+                        diff > 0 ? "DROITE" : "GAUCHE");
+                    s_phase = TREM_ORIENT;
+                    nav_start_smooth_turn(diff);
+                }
             }
             break;
         }
 
-        // ── ORIENT : attendre la fin de la rotation ────────────
+        // ── ORIENT : attendre la fin du smooth turn 90° ────────
         case TREM_ORIENT: {
-            NavState ns = nav_update();
-            if (ns == NAV_DONE) {
-                // Mettre à jour l'orientation du robot dans la carte
+            if (nav_get_state() == NAV_DONE) {
                 maze_set_pos(maze_get_row(), maze_get_col(), s_chosen_dir);
-
-                // Démarrer l'avance vers la case suivante
                 s_phase = TREM_MOVE;
                 nav_start_advance();
+            }
+            break;
+        }
+
+        // ── REVERSE : attendre la fin de la marche arrière ─────
+        case TREM_REVERSE: {
+            if (nav_get_state() == NAV_DONE) {
+                // Position recule (facing inchangé), on saute MOVE et on passe à PAUSE.
+                s_phase = TREM_PAUSE;
+                s_pause_start = millis();
             }
             break;
         }
 
         // ── MOVE : attendre la fin de l'avance ────────────────
         case TREM_MOVE: {
-            NavState ns = nav_update();
-            if (ns == NAV_DONE) {
+            if (nav_get_state() == NAV_DONE) {
+                s_phase = TREM_PAUSE;
+                s_pause_start = millis();
+            }
+            break;
+        }
+
+        // ── PAUSE : attendre TREM_PAUSE_MS avant de scanner la nouvelle case ──
+        // Laisse le temps aux capteurs ToF (mode continu) de produire des
+        // lectures stables et au robot de se stabiliser physiquement.
+        case TREM_PAUSE: {
+            if (millis() - s_pause_start >= (uint32_t)TREM_PAUSE_MS) {
                 s_phase = TREM_UPDATE;
             }
             break;
@@ -200,8 +232,9 @@ bool tremaux_update() {
 
         // ── UPDATE : mise à jour de la position dans la carte ─
         case TREM_UPDATE: {
-            // Avancer la position logique du robot dans la carte
-            maze_advance_robot();
+            // Avance OU recule la position logique selon le dernier mouvement
+            if (s_did_reverse) maze_reverse_robot();
+            else               maze_advance_robot();
             uint8_t row = maze_get_row();
             uint8_t col = maze_get_col();
 

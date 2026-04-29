@@ -17,6 +17,27 @@ static int s_turn         = CALIB_TOF_TURN_MM;
 static int s_opening_l    = CALIB_TOF_OPENING_L_MM;
 static int s_opening_r    = CALIB_TOF_OPENING_R_MM;
 static int s_post_detect  = CALIB_TOF_POST_MM;
+static int s_wall_l       = TOF_WALL_SIDE_MM;
+static int s_wall_r       = TOF_WALL_SIDE_MM;
+static int s_pivot_90_ticks = TICKS_PIVOT_90;
+static int s_cell_ticks     = TICKS_PER_CELL;
+static int s_pivot_45_r     = TICKS_PIVOT_45_R;
+static int s_pivot_45_l     = TICKS_PIVOT_45_L;
+static int s_smooth_move    = TICKS_SPECIAL_MOVE;
+static int s_smooth_center  = SMOOTH_CENTER_TARGET_MM;
+
+// PID parameters
+static float s_pid_kp = PID_KP;
+static float s_pid_ki = PID_KI;
+static float s_pid_kd = PID_KD;
+static float s_pid_tof_kp = PID_TOF_KP;
+static float s_pid_tof_ki = PID_TOF_KI;
+static float s_pid_tof_kd = PID_TOF_KD;
+static int   s_pid_tof_max_corr = PID_TOF_MAX_CORR;
+static float s_pid_piv_kp = PID_PIVOT_KP;
+static float s_pid_piv_ki = PID_PIVOT_KI;
+static float s_pid_piv_kd = PID_PIVOT_KD;
+static int   s_pid_piv_max_corr = PID_PIVOT_MAX_CORR;
 
 // ── calibration_init ──────────────────────────────────────────
 // Monte LittleFS, lit /calib.json si présent.
@@ -35,7 +56,7 @@ bool calibration_init() {
         Serial.println("[CALIB] open FAIL — défauts utilisés");
         return false;
     }
-    StaticJsonDocument<128> doc;
+    StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) {
@@ -47,11 +68,34 @@ bool calibration_init() {
     s_opening_l   = doc["opening_l"]    | CALIB_TOF_OPENING_L_MM;
     s_opening_r   = doc["opening_r"]    | CALIB_TOF_OPENING_R_MM;
     s_post_detect = doc["post_detect"]  | CALIB_TOF_POST_MM;
+    s_wall_l         = doc["wall_l"]          | TOF_WALL_SIDE_MM;
+    s_wall_r         = doc["wall_r"]          | TOF_WALL_SIDE_MM;
+    s_pivot_90_ticks = doc["pivot_90_ticks"]  | TICKS_PIVOT_90;
+    s_cell_ticks     = doc["cell_ticks"]      | TICKS_PER_CELL;
+    s_pivot_45_r     = doc["pivot_45_r"]      | TICKS_PIVOT_45_R;
+    s_pivot_45_l     = doc["pivot_45_l"]      | TICKS_PIVOT_45_L;
+    s_smooth_move    = doc["smooth_move"]     | TICKS_SPECIAL_MOVE;
+    s_smooth_center  = doc["smooth_center"]   | SMOOTH_CENTER_TARGET_MM;
+
+    s_pid_kp = doc["pid_kp"] | PID_KP;
+    s_pid_ki = doc["pid_ki"] | PID_KI;
+    s_pid_kd = doc["pid_kd"] | PID_KD;
+    s_pid_tof_kp = doc["pid_tof_kp"] | PID_TOF_KP;
+    s_pid_tof_ki = doc["pid_tof_ki"] | PID_TOF_KI;
+    s_pid_tof_kd = doc["pid_tof_kd"] | PID_TOF_KD;
+    s_pid_tof_max_corr = doc["pid_tof_max_corr"] | PID_TOF_MAX_CORR;
+    s_pid_piv_kp = doc["pid_piv_kp"] | PID_PIVOT_KP;
+    s_pid_piv_ki = doc["pid_piv_ki"] | PID_PIVOT_KI;
+    s_pid_piv_kd = doc["pid_piv_kd"] | PID_PIVOT_KD;
+    s_pid_piv_max_corr = doc["pid_piv_max_corr"] | PID_PIVOT_MAX_CORR;
+
     Serial.print("[CALIB] chargé: C="); Serial.print(s_center);
     Serial.print(" T=");              Serial.print(s_turn);
     Serial.print(" OL=");             Serial.print(s_opening_l);
     Serial.print(" OR=");             Serial.print(s_opening_r);
-    Serial.print(" POST=");           Serial.println(s_post_detect);
+    Serial.print(" POST=");           Serial.print(s_post_detect);
+    Serial.print(" WL=");             Serial.print(s_wall_l);
+    Serial.print(" WR=");             Serial.println(s_wall_r);
     return true;
 }
 
@@ -61,6 +105,44 @@ int calib_get_turn()        { return s_turn; }
 int calib_get_opening_l()   { return s_opening_l; }
 int calib_get_opening_r()   { return s_opening_r; }
 int calib_get_post_detect() { return s_post_detect; }
+int calib_get_wall_l()         { return s_wall_l; }
+int calib_get_wall_r()         { return s_wall_r; }
+int calib_get_pivot_90_ticks() { return s_pivot_90_ticks; }
+int calib_get_cell_ticks()     { return s_cell_ticks; }
+int calib_get_pivot_45_r()     { return s_pivot_45_r; }
+int calib_get_pivot_45_l()     { return s_pivot_45_l; }
+int calib_get_smooth_move()    { return s_smooth_move; }
+int calib_get_smooth_center()  { return s_smooth_center; }
+void calib_set_pivot_90_ticks(int v) { s_pivot_90_ticks = v; calib_save(); }
+void calib_set_cell_ticks(int v)     { s_cell_ticks     = v; calib_save(); }
+void calib_set_pivot_45_r(int v)     { s_pivot_45_r     = v; calib_save(); }
+void calib_set_pivot_45_l(int v)     { s_pivot_45_l     = v; calib_save(); }
+void calib_set_smooth_move(int v)    { s_smooth_move    = v; calib_save(); }
+void calib_set_smooth_center(int v)  { s_smooth_center  = v; calib_save(); }
+
+float calib_get_pid_kp() { return s_pid_kp; }
+float calib_get_pid_ki() { return s_pid_ki; }
+float calib_get_pid_kd() { return s_pid_kd; }
+float calib_get_pid_tof_kp() { return s_pid_tof_kp; }
+float calib_get_pid_tof_ki() { return s_pid_tof_ki; }
+float calib_get_pid_tof_kd() { return s_pid_tof_kd; }
+int   calib_get_pid_tof_max_corr() { return s_pid_tof_max_corr; }
+float calib_get_pid_piv_kp() { return s_pid_piv_kp; }
+float calib_get_pid_piv_ki() { return s_pid_piv_ki; }
+float calib_get_pid_piv_kd() { return s_pid_piv_kd; }
+int   calib_get_pid_piv_max_corr() { return s_pid_piv_max_corr; }
+
+void calib_set_pid_kp(float v) { s_pid_kp = v; calib_save(); }
+void calib_set_pid_ki(float v) { s_pid_ki = v; calib_save(); }
+void calib_set_pid_kd(float v) { s_pid_kd = v; calib_save(); }
+void calib_set_pid_tof_kp(float v) { s_pid_tof_kp = v; calib_save(); }
+void calib_set_pid_tof_ki(float v) { s_pid_tof_ki = v; calib_save(); }
+void calib_set_pid_tof_kd(float v) { s_pid_tof_kd = v; calib_save(); }
+void calib_set_pid_tof_max_corr(int v) { s_pid_tof_max_corr = v; calib_save(); }
+void calib_set_pid_piv_kp(float v) { s_pid_piv_kp = v; calib_save(); }
+void calib_set_pid_piv_ki(float v) { s_pid_piv_ki = v; calib_save(); }
+void calib_set_pid_piv_kd(float v) { s_pid_piv_kd = v; calib_save(); }
+void calib_set_pid_piv_max_corr(int v) { s_pid_piv_max_corr = v; calib_save(); }
 
 // ── Capture générique (moyenne filtrée sur CALIB_SAMPLES lectures) ──
 // selector : 0=(SL+SR)/2  1=(FL+FR)/2  2=SL  3=SR
@@ -130,6 +212,21 @@ bool calib_capture_opening_r() {
     return true;
 }
 
+bool calib_capture_wall_l() {
+    int v;
+    if (!capture_avg(2, v)) return false;  // SL seul
+    s_wall_l = v;
+    Serial.print("[CALIB] wall_l = "); Serial.print(v); Serial.println(" mm");
+    return true;
+}
+bool calib_capture_wall_r() {
+    int v;
+    if (!capture_avg(3, v)) return false;  // SR seul
+    s_wall_r = v;
+    Serial.print("[CALIB] wall_r = "); Serial.print(v); Serial.println(" mm");
+    return true;
+}
+
 // ── calib_capture_post_detect ─────────────────────────────────
 // Médiane de MIN(SL, SR) sur CALIB_SAMPLES lectures.
 // Utilise la médiane (au lieu de la moyenne) pour rejeter les outliers VL53L0X.
@@ -171,12 +268,32 @@ bool calib_capture_post_detect() {
 
 // ── calib_save ────────────────────────────────────────────────
 bool calib_save() {
-    StaticJsonDocument<160> doc;
+    StaticJsonDocument<512> doc;
     doc["center"]       = s_center;
     doc["turn"]         = s_turn;
     doc["opening_l"]    = s_opening_l;
     doc["opening_r"]    = s_opening_r;
     doc["post_detect"]  = s_post_detect;
+    doc["wall_l"]          = s_wall_l;
+    doc["wall_r"]          = s_wall_r;
+    doc["pivot_90_ticks"]  = s_pivot_90_ticks;
+    doc["cell_ticks"]      = s_cell_ticks;
+    doc["pivot_45_r"]      = s_pivot_45_r;
+    doc["pivot_45_l"]      = s_pivot_45_l;
+    doc["smooth_move"]     = s_smooth_move;
+    doc["smooth_center"]   = s_smooth_center;
+    doc["pid_kp"]          = s_pid_kp;
+    doc["pid_ki"]          = s_pid_ki;
+    doc["pid_kd"]          = s_pid_kd;
+    doc["pid_tof_kp"]      = s_pid_tof_kp;
+    doc["pid_tof_ki"]      = s_pid_tof_ki;
+    doc["pid_tof_kd"]      = s_pid_tof_kd;
+    doc["pid_tof_max_corr"] = s_pid_tof_max_corr;
+    doc["pid_piv_kp"]      = s_pid_piv_kp;
+    doc["pid_piv_ki"]      = s_pid_piv_ki;
+    doc["pid_piv_kd"]      = s_pid_piv_kd;
+    doc["pid_piv_max_corr"] = s_pid_piv_max_corr;
+
     File f = LittleFS.open(CALIB_PATH, "w");
     if (!f) {
         Serial.println("[CALIB] save open FAIL");
@@ -199,6 +316,25 @@ bool calib_reset_defaults() {
     s_opening_l   = CALIB_TOF_OPENING_L_MM;
     s_opening_r   = CALIB_TOF_OPENING_R_MM;
     s_post_detect = CALIB_TOF_POST_MM;
+    s_wall_l         = TOF_WALL_SIDE_MM;
+    s_wall_r         = TOF_WALL_SIDE_MM;
+    s_pivot_90_ticks = TICKS_PIVOT_90;
+    s_cell_ticks     = TICKS_PER_CELL;
+    s_pivot_45_r     = TICKS_PIVOT_45_R;
+    s_pivot_45_l     = TICKS_PIVOT_45_L;
+    s_smooth_move    = TICKS_SPECIAL_MOVE;
+    s_smooth_center  = SMOOTH_CENTER_TARGET_MM;
+    s_pid_kp = PID_KP;
+    s_pid_ki = PID_KI;
+    s_pid_kd = PID_KD;
+    s_pid_tof_kp = PID_TOF_KP;
+    s_pid_tof_ki = PID_TOF_KI;
+    s_pid_tof_kd = PID_TOF_KD;
+    s_pid_tof_max_corr = PID_TOF_MAX_CORR;
+    s_pid_piv_kp = PID_PIVOT_KP;
+    s_pid_piv_ki = PID_PIVOT_KI;
+    s_pid_piv_kd = PID_PIVOT_KD;
+    s_pid_piv_max_corr = PID_PIVOT_MAX_CORR;
     Serial.println("[CALIB] défauts restaurés");
     return calib_save();
 }

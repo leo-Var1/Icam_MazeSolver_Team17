@@ -118,6 +118,31 @@ void imu_reset_heading() {
     s_last_update_ms = millis();
 }
 
+// ── imu_recalibrate ───────────────────────────────────────────
+// Recalibre le biais gyro Z (robot immobile, ~1s).
+// Réinitialise aussi le cap à 0° et le timestamp.
+bool imu_recalibrate() {
+    if (!s_imu_ready) {
+        Serial.println("[IMU] Recalibration impossible — IMU non initialisé");
+        return false;
+    }
+    Serial.print("[IMU] Recalibration biais (immobile)...");
+    float sum = 0.0f;
+    for (int i = 0; i < IMU_CALIB_SAMPLES; i++) {
+        int16_t gx, gy, gz;
+        mpu.getRotation(&gx, &gy, &gz);
+        sum += (float)gz;
+        delay(IMU_SAMPLE_MS);
+    }
+    s_gyro_z_bias    = sum / (float)IMU_CALIB_SAMPLES;
+    s_heading_deg    = 0.0f;
+    s_last_update_ms = millis();
+    Serial.print(" biais Z = ");
+    Serial.print(s_gyro_z_bias, 1);
+    Serial.println(" LSB — cap remis à 0°");
+    return true;
+}
+
 // ── imu_rotation_complete ─────────────────────────────────────
 bool imu_rotation_complete(float target_deg) {
     // On travaille sur la valeur absolue du cap :

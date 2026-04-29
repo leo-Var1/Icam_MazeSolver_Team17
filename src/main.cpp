@@ -13,6 +13,8 @@
 #include "navigation.h"
 #include "web_ui.h"
 #include "calibration.h"
+#include "tremaux.h"
+#include "wall_follower.h"
 
 // ── Objet MCP23017 partagé entre les modules ──────────────────
 Adafruit_MCP23X17 mcp;
@@ -24,7 +26,8 @@ enum RobotState {
     STATE_MAZE_COMPLETE,  // LED verte + jaune — carte ok
     STATE_RUN2_BFS,       // LED verte clignotante — résolution
     STATE_FINISHED,       // LED verte fixe + 3 bips
-    STATE_EMERGENCY       // LED rouge fixe — STOP
+    STATE_EMERGENCY,      // LED rouge fixe — STOP
+    STATE_RUN_WALL_R      // LED jaune fixe — main droite (fallback)
 };
 static RobotState robot_state = STATE_IDLE;
 
@@ -100,6 +103,8 @@ void setup() {
     Serial.println("  ↓  (flèche bas)    → demi-tour 180°");
     Serial.println("  →  (flèche droite) → virage DROITE 90°");
     Serial.println("  ←  (flèche gauche) → virage GAUCHE 90°");
+    Serial.println("  1  → virage PROPRE 45-40-45 GAUCHE");
+    Serial.println("  2  → virage PROPRE 45-40-45 DROITE");
     Serial.println("  s  → STOP d'urgence");
     Serial.println("  l  → moteur GAUCHE seul (diagnostic)");
     Serial.println("  R  → moteur DROIT seul (diagnostic)");
@@ -120,12 +125,37 @@ void loop() {
     }
 
     // ── Navigation : mise à jour du mouvement en cours ────────
-    // nav_update() gère en interne PID, détection fin de mouvement,
-    // et l'affichage Serial live. On récupère l'état pour les LEDs.
     NavState nav_st = nav_update();
-    if (nav_st == NAV_DONE) {
+    if (nav_st == NAV_DONE && robot_state == STATE_IDLE) {
         led_set(mcp, MCP_LED_YELLOW, false);
         led_set(mcp, MCP_LED_GREEN, true);
+    }
+
+    // ── Run 1 : Trémaux ───────────────────────────────────────
+    // tremaux_update() orchestre scan/decide/turn/advance à chaque appel.
+    // Il appelle nav_start_* quand nécessaire ; nav_update() ci-dessus
+    // fait avancer la machine de mouvement à chaque itération de loop().
+    if (robot_state == STATE_RUN1_TREMAUX) {
+        bool exploration_done = tremaux_update();
+        if (exploration_done) {
+            robot_state = STATE_MAZE_COMPLETE;
+            led_set(mcp, MCP_LED_YELLOW, false);
+            led_set(mcp, MCP_LED_GREEN,  true);
+            Serial.println("[TREM] Exploration terminee — Run 2 disponible");
+            maze_print();
+        }
+    }
+
+    // ── Run Main Droite (fallback) ────────────────────────────
+    if (robot_state == STATE_RUN_WALL_R) {
+        bool reached = wall_follower_update();
+        if (reached) {
+            robot_state = STATE_FINISHED;
+            led_set(mcp, MCP_LED_YELLOW, false);
+            led_set(mcp, MCP_LED_GREEN,  true);
+            Serial.println("[WF] Cible atteinte — STATE_FINISHED");
+            maze_print();
+        }
     }
 
     // ── Consommation des commandes reçues depuis l'IHM Web ────
@@ -138,7 +168,6 @@ void loop() {
 
         switch (cmd) {
             case WEB_CMD_STOP:
-                // Priorité absolue : frein immédiat quel que soit l'état
                 nav_abort();
                 robot_state = STATE_EMERGENCY;
                 led_set(mcp, MCP_LED_YELLOW, false);
@@ -147,12 +176,25 @@ void loop() {
                 Serial.println("[WEB] STOP urgence");
                 break;
 
+            case WEB_CMD_RESET_IDLE:
+                nav_abort();
+                maze_init();
+                robot_state = STATE_IDLE;
+                led_set(mcp, MCP_LED_RED,    false);
+                led_set(mcp, MCP_LED_YELLOW, false);
+                led_set(mcp, MCP_LED_GREEN,  true);
+                Serial.println("[WEB] Reset -> IDLE (carte effacée)");
+                break;
+
             case WEB_CMD_START1:
-                // TODO phase 5 : lancer Trémaux — pour l'instant, juste l'état+LED
+                maze_init();  // reset carte des murs + visites
+                nav_abort();  // stoppe tout mouvement résiduel
+                tremaux_init(web_ui_get_start_row(), web_ui_get_start_col(), web_ui_get_start_dir());
                 robot_state = STATE_RUN1_TREMAUX;
+                led_set(mcp, MCP_LED_RED,    false);
                 led_set(mcp, MCP_LED_GREEN,  false);
                 led_set(mcp, MCP_LED_YELLOW, true);
-                Serial.println("[WEB] Run 1 démarré (stub)");
+                Serial.println("[WEB] Run 1 Tremaux DEMARRE");
                 break;
 
             case WEB_CMD_START2:
@@ -161,6 +203,17 @@ void loop() {
                 Serial.print("[WEB] Run 2 démarré (stub) — cible (");
                 Serial.print(web_ui_get_target_row()); Serial.print(",");
                 Serial.print(web_ui_get_target_col()); Serial.println(")");
+                break;
+
+            case WEB_CMD_START_WALL_R:
+                maze_init();
+                nav_abort();
+                wall_follower_init(web_ui_get_start_row(), web_ui_get_start_col(), web_ui_get_start_dir());
+                robot_state = STATE_RUN_WALL_R;
+                led_set(mcp, MCP_LED_RED,    false);
+                led_set(mcp, MCP_LED_GREEN,  false);
+                led_set(mcp, MCP_LED_YELLOW, true);
+                Serial.println("[WEB] Main Droite DEMARRE");
                 break;
 
             case WEB_CMD_MOVE_UP:
@@ -174,6 +227,13 @@ void loop() {
                 break;
             case WEB_CMD_MOVE_RIGHT:
                 if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_turn(1); }
+                break;
+
+            case WEB_CMD_SMOOTH_L:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_smooth_turn(-1); }
+                break;
+            case WEB_CMD_SMOOTH_R:
+                if (libre) { led_set(mcp, MCP_LED_YELLOW, true); nav_start_smooth_turn(1); }
                 break;
 
             case WEB_CMD_CALIB_CENTER:
@@ -204,6 +264,136 @@ void loop() {
             case WEB_CMD_CALIB_POST:
                 if (robot_state == STATE_IDLE) { calib_capture_post_detect(); calib_save(); }
                 else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_WALL_L:
+                if (robot_state == STATE_IDLE) { calib_capture_wall_l(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_WALL_R:
+                if (robot_state == STATE_IDLE) { calib_capture_wall_r(); calib_save(); }
+                else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PIVOT_90:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_pivot_90_ticks(web_ui_last_value());
+                    Serial.print("[CALIB] pivot_90_ticks <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_CELL:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_cell_ticks(web_ui_last_value());
+                    Serial.print("[CALIB] cell_ticks <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PIV45_R:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_pivot_45_r(web_ui_last_value());
+                    Serial.print("[CALIB] pivot_45_r <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PIV45_L:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_pivot_45_l(web_ui_last_value());
+                    Serial.print("[CALIB] pivot_45_l <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_SMOOTH_MOVE:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_smooth_move(web_ui_last_value());
+                    Serial.print("[CALIB] smooth_move <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_SMOOTH_CENTER:
+                if (robot_state == STATE_IDLE) {
+                    calib_set_smooth_center(web_ui_last_value());
+                    Serial.print("[CALIB] smooth_center <- ");
+                    Serial.println(web_ui_last_value());
+                } else Serial.println("[CALIB] ignoré: pas en IDLE");
+                break;
+
+            case WEB_CMD_CALIB_SET_PID_KP:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_kp(val);
+                    Serial.print("[PID] Kp <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_KI:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_ki(val);
+                    Serial.print("[PID] Ki <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_KD:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_kd(val);
+                    Serial.print("[PID] Kd <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_KP:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_tof_kp(val);
+                    Serial.print("[PID-TOF] Kp <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_KI:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_tof_ki(val);
+                    Serial.print("[PID-TOF] Ki <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_KD:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_tof_kd(val);
+                    Serial.print("[PID-TOF] Kd <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_TOF_MAX_CORR:
+                calib_set_pid_tof_max_corr(web_ui_last_value());
+                Serial.print("[PID-TOF] MaxCorr <- "); Serial.println(web_ui_last_value());
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_KP:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_piv_kp(val);
+                    Serial.print("[PID-PIV] Kp <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_KI:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_piv_ki(val);
+                    Serial.print("[PID-PIV] Ki <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_KD:
+                {
+                    float val = web_ui_last_value() / 1000.0f;
+                    calib_set_pid_piv_kd(val);
+                    Serial.print("[PID-PIV] Kd <- "); Serial.println(val, 3);
+                }
+                break;
+            case WEB_CMD_CALIB_SET_PID_PIV_MAX_CORR:
+                calib_set_pid_piv_max_corr(web_ui_last_value());
+                Serial.print("[PID-PIV] MaxCorr <- "); Serial.println(web_ui_last_value());
                 break;
 
             case WEB_CMD_NONE:
@@ -276,7 +466,22 @@ void loop() {
 
         } else {
             // ── Touches simples (non-fléchées) ────────────────
-            if (c == 's') {
+            NavState cur = nav_get_state();
+            bool libre = (cur == NAV_IDLE || cur == NAV_DONE);
+
+            if (c == '1') {
+                // Virage smooth gauche
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_smooth_turn(-1);
+                }
+            } else if (c == '2') {
+                // Virage smooth droite
+                if (libre) {
+                    led_set(mcp, MCP_LED_YELLOW, true);
+                    nav_start_smooth_turn(1);
+                }
+            } else if (c == 's') {
                 // Arrêt d'urgence
                 nav_abort();
                 led_set(mcp, MCP_LED_YELLOW, false);
@@ -319,6 +524,12 @@ void loop() {
                 } else {
                     Serial.println("[TOF-TEST] Mode murs INACTIF");
                 }
+            } else if (c == 'p') {
+                // Toggle PID latéral pour A/B test
+                bool now_on = !pid_tof_is_enabled();
+                pid_tof_set_enabled(now_on);
+                Serial.print("[PID-TOF] ");
+                Serial.println(now_on ? "ACTIVE" : "DESACTIVE (encodeurs seuls)");
             }
         }
     }

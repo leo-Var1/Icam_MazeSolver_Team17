@@ -49,6 +49,10 @@ void maze_set_pos(uint8_t row, uint8_t col, uint8_t dir);
 // (à appeler APRÈS un nav_start_advance() réussi)
 void maze_advance_robot();
 
+// Recule la position du robot d'une case (direction OPPOSÉE au facing).
+// Le facing logique reste inchangé — utilisé après nav_start_reverse().
+void maze_reverse_robot();
+
 // =============================================================
 //  Mise à jour de la carte depuis les capteurs
 // =============================================================
